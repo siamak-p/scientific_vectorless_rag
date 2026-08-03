@@ -1,0 +1,148 @@
+# Provider catalogue.
+#
+# This file is data, not code: adding a provider endpoint or refreshing prices
+# never requires touching the Python sources.
+#
+# `prices` are USD per 1,000,000 tokens and are matched against the model name
+# using the longest matching prefix. They are estimates used only for the cost
+# indicator in the UI.
+
+providers:
+  openai:
+    label: OpenAI
+    kind: cloud
+    models_endpoint: https://api.openai.com/v1/models
+    auth: bearer
+    docs: https://platform.openai.com/docs/models
+    model_filters:
+      include_prefixes: [gpt-, o1, o3, o4, chatgpt-]
+      exclude_contains: [embedding, whisper, tts, dall-e, moderation, audio, realtime, image]
+    prices:
+      gpt-4o-mini: {input: 0.15, output: 0.60}
+      gpt-4o: {input: 2.50, output: 10.00}
+      gpt-4.1-mini: {input: 0.40, output: 1.60}
+      gpt-4.1-nano: {input: 0.10, output: 0.40}
+      gpt-4.1: {input: 2.00, output: 8.00}
+      gpt-4-turbo: {input: 10.00, output: 30.00}
+      gpt-4: {input: 30.00, output: 60.00}
+      gpt-3.5-turbo: {input: 0.50, output: 1.50}
+      gpt-5-mini: {input: 0.25, output: 2.00}
+      gpt-5: {input: 1.25, output: 10.00}
+      o1-mini: {input: 1.10, output: 4.40}
+      o1: {input: 15.00, output: 60.00}
+      o3-mini: {input: 1.10, output: 4.40}
+      o3: {input: 2.00, output: 8.00}
+      o4-mini: {input: 1.10, output: 4.40}
+
+  anthropic:
+    label: Anthropic Claude
+    kind: cloud
+    models_endpoint: https://api.anthropic.com/v1/models
+    auth: x-api-key
+    docs: https://docs.anthropic.com/en/docs/about-claude/models
+    model_filters:
+      include_prefixes: [claude-]
+      exclude_contains: []
+    prices:
+      claude-3-haiku: {input: 0.25, output: 1.25}
+      claude-3-5-haiku: {input: 0.80, output: 4.00}
+      claude-3-5-sonnet: {input: 3.00, output: 15.00}
+      claude-3-7-sonnet: {input: 3.00, output: 15.00}
+      claude-sonnet-4: {input: 3.00, output: 15.00}
+      claude-opus-4: {input: 15.00, output: 75.00}
+      claude-3-opus: {input: 15.00, output: 75.00}
+
+  google:
+    label: Google Gemini
+    kind: cloud
+    models_endpoint: https://generativelanguage.googleapis.com/v1beta/models
+    auth: query-key
+    docs: https://ai.google.dev/gemini-api/docs/models
+    model_filters:
+      include_prefixes: [models/gemini, gemini]
+      exclude_contains: [embedding, aqa, vision-latest, tts, image]
+    prices:
+      gemini-1.5-flash-8b: {input: 0.04, output: 0.15}
+      gemini-1.5-flash: {input: 0.075, output: 0.30}
+      gemini-1.5-pro: {input: 1.25, output: 5.00}
+      gemini-2.0-flash-lite: {input: 0.075, output: 0.30}
+      gemini-2.0-flash: {input: 0.10, output: 0.40}
+      gemini-2.5-flash-lite: {input: 0.10, output: 0.40}
+      gemini-2.5-flash: {input: 0.30, output: 2.50}
+      gemini-2.5-pro: {input: 1.25, output: 10.00}
+
+  groq:
+    label: Groq
+    kind: cloud
+    models_endpoint: https://api.groq.com/openai/v1/models
+    auth: bearer
+    docs: https://console.groq.com/docs/models
+    model_filters:
+      include_prefixes: []
+      exclude_contains: [whisper, tts, guard, embed]
+    prices:
+      llama-3.1-8b: {input: 0.05, output: 0.08}
+      llama-3.3-70b: {input: 0.59, output: 0.79}
+      llama3-70b: {input: 0.59, output: 0.79}
+      llama3-8b: {input: 0.05, output: 0.08}
+      mixtral-8x7b: {input: 0.24, output: 0.24}
+      gemma2-9b: {input: 0.20, output: 0.20}
+      qwen: {input: 0.29, output: 0.39}
+      deepseek-r1: {input: 0.75, output: 0.99}
+      moonshotai: {input: 1.00, output: 3.00}
+      openai/gpt-oss-20b: {input: 0.10, output: 0.50}
+      openai/gpt-oss-120b: {input: 0.15, output: 0.75}
+
+  ollama:
+    label: Ollama
+    kind: local
+    models_endpoint: /api/tags
+    default_base_url: http://localhost:11434
+    docs: https://ollama.com/library
+    prices: {}
+
+  lmstudio:
+    label: LM Studio
+    kind: local
+    models_endpoint: /models
+    default_base_url: http://localhost:1234/v1
+    docs: https://lmstudio.ai/docs
+    prices: {}
+
+# Fallback model list used when a provider's discovery endpoint cannot be
+# reached (offline, missing key, or network restrictions). The user can always
+# type any model name manually.
+fallback_models:
+  openai: [gpt-4o-mini, gpt-4o, gpt-4.1-mini, gpt-4.1]
+  anthropic: [claude-3-5-haiku-latest, claude-3-5-sonnet-latest, claude-sonnet-4-0]
+  google: [gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro]
+  groq: [llama-3.3-70b-versatile, llama-3.1-8b-instant]
+  ollama: []
+  lmstudio: []
+
+# Scientific search endpoints, also data driven.
+search_providers:
+  semantic_scholar:
+    label: Semantic Scholar
+    endpoint: https://api.semanticscholar.org/graph/v1/paper/search
+    requires_key: false
+  openalex:
+    label: OpenAlex
+    endpoint: https://api.openalex.org/works
+    requires_key: false
+  crossref:
+    label: Crossref
+    endpoint: https://api.crossref.org/works
+    requires_key: false
+  arxiv:
+    label: arXiv
+    endpoint: http://export.arxiv.org/api/query
+    requires_key: false
+  pubmed:
+    label: PubMed
+    endpoint: https://eutils.ncbi.nlm.nih.gov/entrez/eutils
+    requires_key: false
+  tavily:
+    label: Tavily
+    endpoint: https://api.tavily.com/search
+    requires_key: true
