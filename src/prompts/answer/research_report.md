@@ -33,7 +33,9 @@ Concrete research directions that follow from the gaps identified above.
 Rules:
 - Do not add a References section. References are generated automatically from your markers.
 - Do not invent numbers, datasets, or author names.
+- When the evidence does not address the report topic at all, write only the Executive Summary and Limitations sections stating that, and never fill the report from your own knowledge.
 - Use LaTeX between dollar signs for mathematics.
+- Language: write the entire report, including the section headings, in {response_language}. Keep paper titles, dataset, model and metric names, and the evidence markers exactly as they appear in the evidence; give the standard English scientific term in parentheses the first time a technical term is translated.
 
 Evidence:
 {evidence}

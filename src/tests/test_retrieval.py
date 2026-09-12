@@ -136,6 +136,41 @@ class _RateLimitedExtractionClient:
         raise RuntimeError("Rate limit exceeded: error code: 429")
 
 
+class _NothingRelevantClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def structured(self, prompt_key, model_cls, temperature=0.0, **kwargs):
+        self.calls += 1
+        return model_cls(items=[])
+
+
+async def test_pages_that_do_not_answer_yield_no_evidence(
+    document: DocumentRecord,
+) -> None:
+    """An empty extraction is a finding, not a failure to paper over.
+
+    The pages share the generic word 'definition' with the question, which
+    used to be enough for lexical passages to be fabricated as evidence and
+    to hide the zero-evidence outcome from the search-recovery route.
+    """
+    pages = [PageContent(
+        page_number=2,
+        text=(
+            "The survey definition committee report describes the galactic plane "
+            "observing strategy and the definition of the survey footprint."
+        ),
+    )]
+    client = _NothingRelevantClient()
+
+    evidence = await EvidenceExtractor(client).extract(
+        document, pages, "What is the definition of atelectasis?"
+    )
+
+    assert client.calls == 1
+    assert evidence == []
+
+
 async def test_rate_limit_uses_exact_page_backed_evidence(
     document: DocumentRecord,
 ) -> None:
@@ -176,6 +211,28 @@ async def test_ranking_without_a_model_falls_back_to_lexical_scoring(
 
     assert rankings[0].document_id == document.id
     assert rankings[0].overall_score > rankings[1].overall_score
+
+
+async def test_no_paper_is_judged_when_all_of_them_will_be_read(
+    document: DocumentRecord,
+) -> None:
+    """Ranking cannot change a selection that already includes every paper."""
+
+    class _CountingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def structured(self, prompt_key, model_cls, temperature=0.0, **kwargs):
+            self.calls += 1
+            return model_cls(judgements=[])
+
+    other = document.model_copy(update={"id": "doc-b"})
+    client = _CountingClient()
+
+    rankings = await PaperRanker(client).rank("What is attention?", [document, other], top_k=3)
+
+    assert client.calls == 0
+    assert len(rankings) == 2
 
 
 def test_duplicate_evidence_is_collapsed(evidence: list[EvidenceItem]) -> None:

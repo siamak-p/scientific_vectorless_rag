@@ -6,39 +6,29 @@ from typing import Any
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 
-from config.catalog import price_table
+from config.pricing import pricing_store
+from config.settings import get_settings
 from core.constants import LLMProviderType
-from core.models import TokenUsage
+from core.models import ModelPrice, TokenUsage
 
 
-def estimate_cost(provider: LLMProviderType, model: str, input_tokens: int, output_tokens: int) -> float:
-    """Estimate the USD cost of a call using the catalogue price table.
+def estimate_cost(
+    provider: LLMProviderType,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    overrides: dict[str, ModelPrice] | None = None,
+) -> float:
+    """Estimate the USD cost of a call from the provider's reported tokens.
 
-    Prices are expressed per one million tokens and matched by the longest
-    model-name prefix, so newly released model revisions inherit the price of
-    their family. Local providers always cost zero.
+    The rate is resolved by :mod:`config.pricing` — a manual override, the
+    downloaded price catalogue, or the offline table — and returns zero only
+    when the model's price is genuinely unknown or the provider is local.
     """
-    if provider.is_local:
+    price = pricing_store.resolve(provider, model, overrides)
+    if price is None:
         return 0.0
-
-    table = price_table(provider)
-    if not table:
-        return 0.0
-
-    name = model.lower()
-    best_key = ""
-    for key in table:
-        lowered = key.lower()
-        if lowered in name and len(lowered) > len(best_key):
-            best_key = lowered
-
-    if not best_key:
-        return 0.0
-
-    prices = next(v for k, v in table.items() if k.lower() == best_key)
-    cost = (input_tokens / 1_000_000) * float(prices.get("input", 0.0))
-    cost += (output_tokens / 1_000_000) * float(prices.get("output", 0.0))
-    return round(cost, 6)
+    return price.cost(input_tokens, output_tokens)
 
 
 class UsageTracker:
@@ -48,6 +38,8 @@ class UsageTracker:
         self._provider = provider
         self._handler = UsageMetadataCallbackHandler()
         self._manual = TokenUsage()
+        # Read once: a turn makes dozens of costed calls.
+        self._overrides = get_settings().pricing.overrides
 
     @property
     def callbacks(self) -> list[Any]:
@@ -56,7 +48,9 @@ class UsageTracker:
 
     def record_manual(self, input_tokens: int, output_tokens: int, model: str) -> None:
         """Record usage for a call that did not report usage metadata."""
-        cost = estimate_cost(self._provider, model, input_tokens, output_tokens)
+        cost = estimate_cost(
+            self._provider, model, input_tokens, output_tokens, self._overrides
+        )
         self._manual = self._manual.add(
             TokenUsage(
                 input_tokens=input_tokens,
@@ -79,7 +73,7 @@ class UsageTracker:
                     output_tokens=output_tokens,
                     total_tokens=int(usage.get("total_tokens", input_tokens + output_tokens)),
                     estimated_cost_usd=estimate_cost(
-                        self._provider, model, input_tokens, output_tokens
+                        self._provider, model, input_tokens, output_tokens, self._overrides
                     ),
                     calls=1,
                 )

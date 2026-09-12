@@ -119,6 +119,12 @@ class PaperRanker:
         widens the shortlist and never starves the ranking of real
         alternatives. When `top_k` is unknown, every candidate is judged.
         """
+        # A judgement cannot change which papers are read when every candidate
+        # is already inside the reading budget, which is the common case for a
+        # small chat corpus. The free signals still order the trace.
+        if top_k is not None and len(documents) <= max(1, top_k):
+            return set()
+
         budget = _judge_budget(top_k, len(documents))
         if budget >= len(documents):
             return set(range(len(documents)))

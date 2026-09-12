@@ -168,8 +168,11 @@ class TreeNavigator:
             shares=shares,
         )
 
-        if not result.pages_by_document:
-            self._apply_fallback(candidates, result, question, shares)
+        # Ranking already decided these papers are worth reading. A document
+        # whose sections were all rejected must still contribute something
+        # citable, otherwise one paper that happened to be selected supplies
+        # every reference in the answer while the rest are silently dropped.
+        self._rescue_unread(candidates, result, question, shares)
 
         log_event(
             logger,
@@ -365,35 +368,79 @@ class TreeNavigator:
         result.pages_by_document[node.document_id] = sorted(existing)
 
     @staticmethod
-    def _apply_fallback(
+    def _rescue_unread(
         candidates: list[TreeNode],
         result: NavigationResult,
         question: str,
         shares: dict[str, int],
     ) -> None:
-        """Read the opening pages of each document when nothing was selected."""
+        """Give every ranked document that selected no page a second chance.
+
+        The pages are chosen by free lexical overlap with the question, so the
+        rescue costs no provider call and still lands on the part of the paper
+        most likely to answer it.
+        """
         for node in candidates:
-            if not node.document_id:
+            document_id = node.document_id
+            if not document_id or result.pages_by_document.get(document_id):
                 continue
-            start = node.page_start or 1
-            count = min(_FALLBACK_PAGES, shares.get(node.document_id, _FALLBACK_PAGES))
-            end = min(start + count - 1, node.page_end or start)
-            result.pages_by_document[node.document_id] = list(range(start, end + 1))
+
+            budget = max(1, min(_FALLBACK_PAGES, shares.get(document_id, _FALLBACK_PAGES)))
+            section, pages = _closest_section(node, question, budget)
+            if not pages:
+                continue
+
+            result.pages_by_document[document_id] = pages
             result.decisions.append(
                 NavigationDecision(
-                    node_id=node.node_id,
-                    document_id=node.document_id,
+                    node_id=section.node_id,
+                    document_id=document_id,
                     document_title=node.title,
-                    section_name=node.title,
-                    level=node.level,
+                    section_name=section.title,
+                    parent_section=node.title,
+                    level=section.level,
                     decision=NodeDecision.PARTIALLY_SELECTED,
-                    reason="No section was judged relevant, so the opening pages were read instead.",
+                    reason=(
+                        "No section was judged relevant, so the closest matching "
+                        "pages were read instead."
+                    ),
                     relevance_score=0.2,
                     confidence_score=0.2,
-                    related_pages=list(range(start, end + 1)),
+                    related_pages=pages,
                     sub_question=question,
                 )
             )
+
+
+def _closest_section(
+    document_node: TreeNode, question: str, budget: int
+) -> tuple[TreeNode, list[int]]:
+    """Return the section of a document that best matches the question."""
+    query_terms = {
+        term for term in _WORD_RE.findall(question.lower())
+        if len(term) > 1 and term not in _NAVIGATION_STOPWORDS
+    }
+
+    best_node = document_node
+    best_score = -1.0
+    for node in _descendants(document_node):
+        if not node.page_range():
+            continue
+        terms = set(_WORD_RE.findall(f"{node.title} {node.summary}".lower()))
+        score = len(query_terms & terms) / max(1, len(query_terms))
+        if score > best_score:
+            best_node, best_score = node, score
+
+    pages = best_node.page_range() or document_node.page_range()
+    return best_node, pages[:budget]
+
+
+def _descendants(node: TreeNode) -> list[TreeNode]:
+    """Return every node below (and including) this one."""
+    collected: list[TreeNode] = [node]
+    for child in node.children:
+        collected.extend(_descendants(child))
+    return collected
 
 
 def _clamp(value: float) -> float:

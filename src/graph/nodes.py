@@ -8,6 +8,7 @@ is recorded in ``error`` so the graph can route to a graceful response.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 
 from pydantic import BaseModel, Field
@@ -17,10 +18,12 @@ from core.constants import (
     DocumentSource,
     DOWNLOAD_CONCURRENCY,
     MAX_EVIDENCE_ITEMS,
+    MIN_SEARCH_RELEVANCE,
     SearchProviderType,
 )
 from core.exceptions import ScientificRAGError
 from core.models import (
+    AppSettings,
     DocumentRecord,
     EvidenceItem,
     PaperRankingEntry,
@@ -46,7 +49,11 @@ from retrieval.validation import AnswerValidator
 from scientific_search.aggregator import (
     SearchAggregator,
     available_providers,
+    build_providers,
+    covering_providers,
     effective_search_providers,
+    merge_results,
+    uncovered_domain,
 )
 from scientific_search.base import SearchResult
 from scientific_search.downloader import PaperDownloader
@@ -80,6 +87,16 @@ _CONVERSATIONAL_PATTERN = re.compile(
 )
 
 _SEARCH_ASSESSMENT_ABSTRACT_CHARS = 1_200
+_SCREENING_ABSTRACT_CHARS = 1_500
+# How many lexically eligible results are shown to the screening model per
+# paper actually wanted, so rejections still leave enough to fill the request.
+_SCREENING_POOL_FACTOR = 3
+_ENGLISH_NAMES = {"english", "en", "en-us", "en-gb"}
+_DEFAULT_LABELS = {"notes": "Notes", "references": "References"}
+_DEFAULT_CLARIFICATION = (
+    "I could not identify the topic of your question with enough confidence to "
+    "search the literature. Could you rephrase it, or name the scientific term you mean?"
+)
 
 
 def _is_trivially_conversational(query: str) -> bool:
@@ -98,11 +115,52 @@ def _is_trivially_conversational(query: str) -> bool:
 class _PlanSchema(BaseModel):
     """Query understanding output."""
 
+    language: str = Field(
+        default="", description="English name of the language the user wrote in."
+    )
+    domain: str = Field(
+        default="",
+        description=(
+            "Research field: biomedicine, physics, mathematics, computer_science, engineering, "
+            "chemistry, earth_and_environment, social_sciences, humanities, economics or general."
+        ),
+    )
     intent: str = Field(default="", description="One sentence describing the goal.")
     is_conversational: bool = Field(default=False)
     requires_multi_hop: bool = Field(default=False)
     sub_questions: list[str] = Field(default_factory=list)
     search_queries: list[str] = Field(default_factory=list)
+    needs_clarification: bool = Field(
+        default=False,
+        description="True only when the request cannot be researched without asking the user.",
+    )
+    clarification_question: str = Field(
+        default="", description="Question for the user, in the user's language."
+    )
+    correction_note: str = Field(
+        default="",
+        description="Short note in the user's language about a corrected term; empty if none.",
+    )
+
+
+class _ScreeningVerdict(BaseModel):
+    """Whether one search result is about the question at all."""
+
+    index: int
+    relevant: bool = False
+    reason: str = ""
+
+
+class _SearchScreening(BaseModel):
+    """Verdicts for every screened search result."""
+
+    verdicts: list[_ScreeningVerdict] = Field(default_factory=list)
+
+
+class _LocalizedItems(BaseModel):
+    """System notices translated into the user's language, same order as input."""
+
+    items: list[str] = Field(default_factory=list)
 
 
 class WorkflowNodes:
@@ -161,11 +219,46 @@ class WorkflowNodes:
                 for question in result.sub_questions
                 if question.strip()
             ],
+            language=result.language.strip(),
+            domain=result.domain.strip().lower(),
+            needs_clarification=(
+                result.needs_clarification and not result.is_conversational
+            ),
+            clarification_question=result.clarification_question.strip(),
+            correction_note=result.correction_note.strip(),
         )
+
+        if plan.needs_clarification:
+            log_event(
+                logger,
+                "node.planning",
+                "The question needs clarification before it can be researched",
+                chat_id=state.get("chat_id", ""),
+                query=query[:200],
+                clarification=plan.clarification_question[:300],
+            )
 
         return {
             "query_plan": plan,
             "is_conversational": plan.is_conversational,
+            "needs_clarification": plan.needs_clarification,
+            "token_usage": self.context.take_usage(),
+        }
+
+    async def ask_clarification(self, state: GraphState) -> GraphState:
+        """Ask the user what they meant instead of researching a guess.
+
+        Reached only when the planner could not identify the topic. Nothing is
+        searched or read; the next turn resolves the answer through history.
+        """
+        self.context.emit_stage("Asking for clarification")
+        plan: QueryPlan | None = state.get("query_plan")
+        question = plan.clarification_question.strip() if plan else ""
+        if not question:
+            question = (await self._localize(state, [_DEFAULT_CLARIFICATION]))[0]
+        return {
+            "answer": question,
+            "citations": [],
             "token_usage": self.context.take_usage(),
         }
 
@@ -239,6 +332,7 @@ class WorkflowNodes:
             "node.search_assessment",
             "Search need assessed",
             search_needed=assessment.search_needed,
+            corpus_relevant=assessment.corpus_relevant,
             suggested_papers=assessment.suggested_papers,
             existing_papers=len(documents),
             reason=assessment.reasoning,
@@ -331,6 +425,9 @@ class WorkflowNodes:
             queries,
             limit=limit,
             existing=state.get("documents", []),
+            question=state["query"],
+            intent=plan.intent if plan else "",
+            domain=plan.domain if plan else "",
         )
 
         documents = list(state.get("documents", [])) + added
@@ -356,7 +453,11 @@ class WorkflowNodes:
         # judgement shortlist too, so more papers requested means a wider
         # shortlist rather than a fixed cutoff.
         keep = max(1, self.context.settings.retrieval.max_search_papers)
-        rankings = await ranker.rank(state["query"], documents, top_k=keep)
+        # Rank against the English intent: title/abstract overlap with a
+        # Persian (or any non-English) question is zero by construction.
+        plan: QueryPlan | None = state.get("query_plan")
+        question = plan.intent if plan and plan.intent else state["query"]
+        rankings = await ranker.rank(question, documents, top_k=keep)
         selected = _select_documents_to_read(
             rankings,
             keep,
@@ -501,6 +602,7 @@ class WorkflowNodes:
                 recent_messages=state.get("history", ""),
                 global_topics=state.get("global_topics", ""),
                 query=state["query"],
+                response_language=_response_language(state),
             ):
                 chunks.append(token)
                 self.context.emit_token(token)
@@ -517,7 +619,7 @@ class WorkflowNodes:
         """Generate the grounded answer, streaming it to the interface."""
         evidence = state.get("evidence", [])
         if not evidence:
-            return {"answer": _no_evidence_message(state)}
+            return {"answer": _no_evidence_message(state), "answer_is_notice": True}
 
         mode: AnswerMode = state.get("mode", AnswerMode.SHORT_ANSWER)
         self.context.emit_stage("Writing the answer")
@@ -525,6 +627,7 @@ class WorkflowNodes:
         values = {
             "question": state["query"],
             "evidence": format_evidence_block(evidence),
+            "response_language": _response_language(state),
         }
         if mode is AnswerMode.SHORT_ANSWER:
             values["style_instruction"] = _STYLE_INSTRUCTIONS[mode]
@@ -555,6 +658,26 @@ class WorkflowNodes:
         corrected, report = await validator.validate(state["query"], answer, evidence)
         final, citations = build_citations(corrected, evidence, documents_by_id(state))
 
+        # Evidence was retrieved but nothing in the reply ended up resting on
+        # it: what survives is the model's own knowledge, which this
+        # assistant must not present as a sourced answer.
+        if not citations:
+            log_event(
+                logger,
+                "node.validate",
+                "The answer cited no retrieved evidence and was replaced",
+                level=30,
+                chat_id=state.get("chat_id", ""),
+                evidence=len(evidence),
+            )
+            return {
+                "answer": _ungrounded_message(state),
+                "answer_is_notice": True,
+                "citations": [],
+                "validation": report,
+                "token_usage": self.context.take_usage(),
+            }
+
         return {
             "answer": final,
             "citations": citations,
@@ -563,38 +686,186 @@ class WorkflowNodes:
         }
 
     async def format_output(self, state: GraphState) -> GraphState:
-        """Assemble the payload the interface renders and stores."""
+        """Assemble the payload the interface renders and stores.
+
+        Model-written answers already follow the user's language; the parts
+        produced by code (notices, warnings, section labels) are translated
+        here in one call so the whole reply reads in that language.
+        """
         citations = state.get("citations", [])
         style = self.context.settings.research.citation_format
+        plan: QueryPlan | None = state.get("query_plan")
+
+        answer = state.get("answer", "")
+        warnings = list(state.get("warnings", []))
+        references = format_bibliography(citations, style) if citations else ""
+        labels = dict(_DEFAULT_LABELS)
+
+        pending: list[tuple[str, str]] = []
+        if state.get("answer_is_notice") and answer:
+            pending.append(("answer", answer))
+        pending.extend((f"warning:{index}", text) for index, text in enumerate(warnings))
+        if warnings:
+            pending.append(("label:notes", labels["notes"]))
+        if references:
+            pending.append(("label:references", labels["references"]))
+
+        translated = await self._localize(state, [text for _, text in pending])
+        for (slot, _), text in zip(pending, translated):
+            if slot == "answer":
+                answer = text
+            elif slot.startswith("warning:"):
+                warnings[int(slot.split(":", 1)[1])] = text
+            else:
+                labels[slot.split(":", 1)[1]] = text
+
+        # Tell the user how a mistyped or non-standard term was read, so a
+        # wrong guess is visible instead of silently answered.
+        if (
+            plan
+            and plan.correction_note
+            and not plan.needs_clarification
+            and not state.get("is_conversational")
+        ):
+            answer = f"> {plan.correction_note}\n\n{answer}"
 
         payload = {
-            "references": format_bibliography(citations, style) if citations else "",
+            "references": references,
             "citation_format": style.value,
             "evidence_count": len(state.get("evidence", [])),
             "documents_consulted": sorted(
                 {item.document_title for item in state.get("evidence", [])}
             ),
+            "labels": labels,
         }
-        return {"formatted_answer": payload}
+        return {
+            "formatted_answer": payload,
+            "answer": answer,
+            "warnings": warnings,
+            "token_usage": self.context.take_usage(),
+        }
 
     async def handle_error(self, state: GraphState) -> GraphState:
         """Turn a recorded failure into a readable reply."""
         message = state.get("error") or "The request could not be completed."
+        log_event(logger, "workflow.error", "Turn failed", level=40,
+                  chat_id=state.get("chat_id", ""), detail=message)
+
         if _is_rate_limit_text(message):
+            # The provider is out of capacity; a translation call would only
+            # fail against the same limit.
             return {
                 "answer": (
                     "**The configured LLM provider has reached its rate limit.**\n\n"
                     "Please retry after the provider quota resets."
-                )
+                ),
+                "answer_is_notice": True,
             }
+        # The recorded text is a ScientificRAGError's user_message, which is
+        # written to be shown: hiding it leaves the user with nothing to act on.
+        answer = (
+            "**The request could not be completed.**\n\n"
+            f"{message}\n\n"
+            "Check the provider, model and credentials on the Settings page, "
+            "then retry."
+        )
         return {
-            "answer": (
-                "**The request could not be completed automatically.**\n\n"
-                "Please retry."
-            )
+            "answer": (await self._localize(state, [answer]))[0],
+            "answer_is_notice": True,
         }
 
     # -- shared helpers --------------------------------------------------
+
+    async def _localize(self, state: GraphState, texts: list[str]) -> list[str]:
+        """Translate code-generated notices into the user's language.
+
+        The facts are fixed by the caller; only the wording changes. English
+        (or an unknown language) and any failure return the originals, so a
+        notice is never lost to a translation problem.
+        """
+        plan: QueryPlan | None = state.get("query_plan")
+        language = plan.language.strip() if plan and plan.language else ""
+        if not texts or not language or language.lower() in _ENGLISH_NAMES:
+            return texts
+
+        try:
+            result = await self.context.client.structured(
+                "system/localize_notice",
+                _LocalizedItems,
+                temperature=0.0,
+                language=language,
+                items="\n".join(json.dumps(text, ensure_ascii=False) for text in texts),
+            )
+        except Exception as exc:  # noqa: BLE001 - the English notice is still correct
+            log_event(logger, "node.localize", "Notice translation failed",
+                      level=30, language=language, error=str(exc))
+            return texts
+
+        items = [item.strip() for item in result.items]
+        if len(items) != len(texts) or not all(items):
+            log_event(logger, "node.localize", "Notice translation returned a mismatched list",
+                      level=30, language=language, expected=len(texts), received=len(items))
+            return texts
+        return items
+
+    async def _screen_candidates(
+        self,
+        question: str,
+        intent: str,
+        pool: list[SearchResult],
+        limit: int,
+    ) -> tuple[list[SearchResult], int, bool]:
+        """Judge title and abstract before anything is downloaded.
+
+        Lexical overlap cannot tell a shared generic word ("definition",
+        "report") from topical fit, and a database always returns its best
+        matches; this is the reading a researcher does before downloading.
+        Returns the accepted results, the number rejected, and whether the
+        model call hit a rate limit. A failed call keeps the lexical order.
+        """
+        if not pool:
+            return [], 0, False
+
+        rendered = "\n\n".join(
+            f"CANDIDATE {index}\n"
+            f"title: {result.metadata.title}\n"
+            f"year: {result.metadata.publication_year or 'unknown'}\n"
+            f"venue: {result.metadata.journal or result.metadata.conference or 'unknown'}\n"
+            f"abstract: {(result.metadata.abstract or 'not available')[:_SCREENING_ABSTRACT_CHARS]}"
+            for index, result in enumerate(pool)
+        )
+        try:
+            screening = await self.context.client.structured(
+                "retrieval/search_result_screening",
+                _SearchScreening,
+                temperature=0.0,
+                question=question,
+                intent=intent or question,
+                candidates=rendered,
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the lexical floor
+            log_event(logger, "node.auto_search", "Search result screening failed; "
+                      "using lexical relevance only", level=30, error=str(exc))
+            return pool[:limit], 0, _is_rate_limit_text(str(exc))
+
+        if not screening.verdicts:
+            return pool[:limit], 0, False
+
+        verdicts = {item.index: item for item in screening.verdicts}
+        accepted: list[SearchResult] = []
+        rejected: list[str] = []
+        for index, result in enumerate(pool):
+            verdict = verdicts.get(index)
+            # A candidate the model did not judge is not downloaded: indexing
+            # an unknown is how an off-topic paper becomes the answer's source.
+            if verdict is not None and verdict.relevant:
+                accepted.append(result)
+            else:
+                rejected.append(result.metadata.title)
+        if rejected:
+            log_event(logger, "node.auto_search", "Search results screened out as off topic",
+                      question=question[:120], rejected=rejected[:10])
+        return accepted[:limit], len(rejected), False
 
     async def search_and_index(
         self,
@@ -602,13 +873,22 @@ class WorkflowNodes:
         queries: list[str],
         limit: int,
         existing: list[DocumentRecord],
+        question: str = "",
+        intent: str = "",
+        domain: str = "",
     ) -> tuple[list[DocumentRecord], list[str]]:
         """Search, download and index new open-access papers for a chat.
 
-        Every selected paper is downloaded concurrently, then indexed in one
-        batch: their PageIndex trees are built together and the chat's
-        forest is updated once for the whole set, not once per paper -
-        regardless of how many papers `limit` asks for.
+        The selected databases are queried first. When none of the working
+        ones indexes the question's field (``domain``), the key-free databases
+        that do are queried as well and the user is told - a clinical question
+        sent only to arXiv can never be answered, however good the query.
+        Results pass a lexical relevance floor and then a title/abstract
+        screening against ``question`` before any download, so an off-topic
+        paper is never indexed. Every selected paper is downloaded
+        concurrently, then indexed in one batch: their PageIndex trees are
+        built together and the chat's forest is updated once for the whole
+        set, not once per paper - regardless of how many papers `limit` asks for.
         """
         settings = self.context.settings
         configured_cap = max(1, settings.retrieval.max_search_papers)
@@ -616,13 +896,12 @@ class WorkflowNodes:
         if limit == 0:
             return [], []
 
-        aggregator = SearchAggregator(settings)
         warnings: list[str] = []
 
         unconfigured = [
             provider
             for provider in settings.retrieval.search_providers
-            if provider is not SearchProviderType.TAVILY
+            if provider.is_builtin_database
             and provider not in available_providers(settings)
         ]
         warnings.extend(
@@ -631,31 +910,57 @@ class WorkflowNodes:
             for provider in unconfigured
         )
 
-        try:
-            results = await aggregator.search(
-                queries,
-                limit_per_query=max(3, limit),
-                providers=effective_search_providers(settings),
-            )
-        except ScientificRAGError as exc:
-            details = f"{exc.user_message} {exc.details or ''}"
-            if _is_rate_limit_text(details):
-                return [], [
-                    "The configured scientific search providers reached their rate limits."
-                ]
-            log_event(
-                logger,
-                "node.auto_search",
-                "Scientific search failed internally",
-                level=30,
-                error=str(exc),
-            )
-            return [], []
+        async def run_search(
+            providers: list[SearchProviderType],
+        ) -> tuple[list[SearchResult], dict[str, str]]:
+            aggregator = SearchAggregator(settings)
+            try:
+                found = await aggregator.search(
+                    queries, limit_per_query=max(3, limit), providers=providers
+                )
+            except ScientificRAGError as exc:
+                # Every provider failed; the per-provider reasons are what
+                # the user needs, not the aggregate.
+                log_event(logger, "node.auto_search", "Scientific search failed internally",
+                          level=30, error=str(exc), providers=[p.value for p in providers])
+                return [], dict(aggregator.provider_errors) or {
+                    p.label: exc.user_message for p in providers
+                }
+            return found, dict(aggregator.provider_errors)
+
+        selected = effective_search_providers(settings)
+        results, provider_errors = await run_search(selected)
+
+        if uncovered_domain(settings, selected, domain, set(provider_errors)):
+            fallback = covering_providers(settings, domain, exclude=selected)
+            if fallback:
+                log_event(
+                    logger,
+                    "node.auto_search",
+                    "Selected databases cannot cover this field; querying key-free ones that do",
+                    chat_id=chat_id,
+                    domain=domain,
+                    selected=[p.value for p in selected],
+                    added=[p.value for p in fallback],
+                )
+                extra, extra_errors = await run_search(fallback)
+                results = merge_results(results + extra)
+                provider_errors.update(extra_errors)
+                warnings.append(
+                    _coverage_warning(settings, selected, fallback, domain, provider_errors)
+                )
+
+        if not results and provider_errors:
+            return [], warnings + [_search_outcome_summary(results, provider_errors)]
 
         warnings.extend(
-            f"Scientific search provider '{name}' reached its rate limit; "
+            f"Scientific search provider '{name}' reached its rate limit; results from the "
+            "other configured providers were used. A Semantic Scholar API key "
+            "(Settings \u2192 Search) raises that limit."
+            if name == SearchProviderType.SEMANTIC_SCHOLAR.label
+            else f"Scientific search provider '{name}' reached its rate limit; "
             "results from the other configured providers were used."
-            for name, reason in aggregator.provider_errors.items()
+            for name, reason in provider_errors.items()
             if _is_rate_limit_text(reason)
         )
 
@@ -663,16 +968,36 @@ class WorkflowNodes:
         downloader = PaperDownloader()
         processor = self.context.processor()
 
-        candidates: list[SearchResult] = []
-        for result in results:
-            if len(candidates) >= limit:
-                break
-            if result.metadata.title.lower() in known_titles:
-                continue
-            if not (result.is_open_access and settings.retrieval.download_pdfs):
-                continue
-            candidates.append(result)
-            known_titles.add(result.metadata.title.lower())
+        pool, rejected = _eligible_candidates(
+            results,
+            limit * _SCREENING_POOL_FACTOR,
+            known_titles,
+            settings.retrieval.download_pdfs,
+        )
+        candidates, screened_out, screening_rate_limited = await self._screen_candidates(
+            question or " ; ".join(queries), intent, pool, limit
+        )
+        rejected += screened_out
+        if screening_rate_limited:
+            warnings.append(
+                "The configured LLM provider reached its rate limit while screening "
+                "search results; lexical matching was used instead."
+            )
+
+        if rejected and not candidates:
+            log_event(
+                logger,
+                "node.auto_search",
+                "Every search result was off topic and none was indexed",
+                level=30,
+                chat_id=chat_id,
+                queries=queries[:4],
+                rejected=rejected,
+            )
+            warnings.append(
+                "None of the papers the scientific databases returned is about this "
+                f"question, so none was downloaded. {_search_outcome_summary(results, provider_errors)}"
+            )
 
         added: list[DocumentRecord] = []
         if candidates:
@@ -761,6 +1086,13 @@ class WorkflowNodes:
             return [], []
 
 
+def _response_language(state: GraphState) -> str:
+    """Name the language the reply must be written in."""
+    plan: QueryPlan | None = state.get("query_plan")
+    language = plan.language.strip() if plan and plan.language else ""
+    return language or "the same language as the user's message"
+
+
 def _is_rate_limit_text(message: str) -> bool:
     text = message.lower()
     return any(marker in text for marker in (
@@ -811,15 +1143,126 @@ def _no_evidence_message(state: GraphState) -> str:
     )
 
 
+def _search_outcome_summary(results: list[SearchResult], errors: dict[str, str]) -> str:
+    """Say what each database actually did, so a dead end is diagnosable."""
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.source_label] = counts.get(result.source_label, 0) + 1
+    parts = [f"{label} returned {count} result(s)" for label, count in sorted(counts.items())]
+    for label, reason in sorted(errors.items()):
+        parts.append(
+            f"{label}: rate limit" if _is_rate_limit_text(reason) else f"{label}: failed"
+        )
+    return ("Databases: " + "; ".join(parts) + ".") if parts else ""
+
+
+def _coverage_warning(
+    settings: AppSettings,
+    selected: list[SearchProviderType],
+    added: list[SearchProviderType],
+    domain: str,
+    errors: dict[str, str],
+) -> str:
+    """Explain why databases the user did not select were queried this turn."""
+    field = domain.replace("_", " ")
+    reasons: list[str] = []
+    for provider in build_providers(selected, settings):
+        if provider.label in errors:
+            reasons.append(
+                f"{provider.label} hit its rate limit"
+                if _is_rate_limit_text(errors[provider.label])
+                else f"{provider.label} failed"
+            )
+        elif not provider.covers(domain):
+            reasons.append(f"{provider.label} does not index {field}")
+    detail = f" ({'; '.join(reasons)})" if reasons else ""
+    names = ", ".join(provider.label for provider in build_providers(added, settings))
+    return (
+        f"None of the selected databases could cover this {field} question{detail}, "
+        f"so {names} were also queried. Select them under Settings \u2192 Search to make "
+        "this permanent."
+    )
+
+
+def _eligible_candidates(
+    results: list[SearchResult],
+    limit: int,
+    known_titles: set[str],
+    download_pdfs: bool,
+) -> tuple[list[SearchResult], int]:
+    """Pick which search results are worth downloading and indexing.
+
+    Returns the candidates plus how many were dropped for being off topic. A
+    database always answers with its best matches however weak they are, so
+    without this floor an unrelated paper gets indexed and then becomes the
+    source the question is answered from.
+    """
+    candidates: list[SearchResult] = []
+    rejected = 0
+
+    for result in results:
+        if len(candidates) >= limit:
+            break
+        title = result.metadata.title.lower()
+        if title in known_titles:
+            continue
+        if not (result.is_open_access and download_pdfs):
+            continue
+        if result.query_relevance < MIN_SEARCH_RELEVANCE:
+            rejected += 1
+            continue
+        candidates.append(result)
+        known_titles.add(title)
+
+    return candidates, rejected
+
+
+def _ungrounded_message(state: GraphState) -> str:
+    """Explain that the indexed papers do not answer the question.
+
+    Only reached when evidence existed but the reply cited none of it, which
+    means the reply was the model's own knowledge rather than the sources.
+    """
+    titles = sorted({item.document_title for item in state.get("evidence", []) if item.document_title})
+    consulted = "\n".join(f"- {title}" for title in titles[:5])
+    body = (
+        "**The papers available in this chat do not answer this question.**\n\n"
+        "Pages were read, but nothing in them supports an answer, and this assistant "
+        "only answers from its sources."
+    )
+    if consulted:
+        body += f"\n\nPapers consulted:\n{consulted}"
+    if state.get("search_attempted"):
+        return (
+            f"{body}\n\nAutomatic scientific search was already attempted. Try rephrasing "
+            "the question with the standard scientific term for the topic, selecting more "
+            "databases, or uploading a relevant PDF."
+        )
+    return (
+        f"{body}\n\nEnable automatic scientific search, or upload a paper that covers "
+        "this topic."
+    )
+
+
 def _normalise_search_assessment(
     assessment: SearchAssessment,
     cap: int,
     corpus_empty: bool,
     force_search: bool = False,
 ) -> SearchAssessment:
-    """Enforce the configured cap and the minimum viable empty-corpus behavior."""
+    """Enforce the configured cap and the minimum viable empty-corpus behavior.
+
+    A corpus with no paper on the topic can never answer the question, so the
+    model's own "no search needed" is overridden in that case: this assistant
+    has no general-knowledge fallback to fall back on.
+    """
     limit = max(1, cap)
-    search_needed = assessment.search_needed or corpus_empty or force_search
+    search_needed = (
+        assessment.search_needed
+        or corpus_empty
+        or force_search
+        or not assessment.corpus_relevant
+    )
     suggested = min(limit, max(1, assessment.suggested_papers)) if search_needed else 0
     return assessment.model_copy(
         update={"search_needed": search_needed, "suggested_papers": suggested}

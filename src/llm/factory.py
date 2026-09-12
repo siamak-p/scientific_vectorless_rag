@@ -22,8 +22,9 @@ from core.exceptions import (
     ProviderUnavailableError,
 )
 from core.models import AppSettings, ProviderSettings
-from llm.base import ModelInfo, ProviderAdapter
+from llm.base import ModelCatalog, ModelInfo, ProviderAdapter
 from llm.providers.claude_provider import ClaudeAdapter
+from llm.providers.custom_provider import CustomOpenAIAdapter
 from llm.providers.gemini_provider import GeminiAdapter
 from llm.providers.groq_provider import GroqAdapter
 from llm.providers.lmstudio_provider import LMStudioAdapter
@@ -40,6 +41,7 @@ _ADAPTERS: dict[LLMProviderType, type[ProviderAdapter]] = {
     LLMProviderType.GROQ: GroqAdapter,
     LLMProviderType.OLLAMA: OllamaAdapter,
     LLMProviderType.LMSTUDIO: LMStudioAdapter,
+    LLMProviderType.CUSTOM: CustomOpenAIAdapter,
 }
 
 # Chat models are cheap to reuse and expensive to keep rebuilding: every node
@@ -82,20 +84,39 @@ def resolve_provider(provider: LLMProviderType | str | None = None) -> LLMProvid
 def get_adapter(
     provider: LLMProviderType | str | None = None,
     settings: AppSettings | None = None,
+    config: ProviderSettings | None = None,
 ) -> ProviderAdapter:
-    """Return the adapter instance for a provider."""
+    """Return the adapter instance for a provider.
+
+    ``config`` lets a caller supply credentials that are not persisted yet —
+    the Settings page must be able to test a key the moment it is typed.
+    """
     provider_type = resolve_provider(provider)
-    app_settings = settings or get_settings()
-    config: ProviderSettings = app_settings.provider(provider_type)
+    if config is None:
+        app_settings = settings or get_settings()
+        config = app_settings.provider(provider_type)
     adapter_class = _ADAPTERS.get(provider_type)
     if adapter_class is None:
         raise ProviderUnavailableError(provider_type.value, "No adapter is registered.")
     return adapter_class(config)
 
 
-async def list_models(provider: LLMProviderType | str | None = None) -> list[ModelInfo]:
+async def fetch_models(
+    provider: LLMProviderType | str | None = None,
+    settings: AppSettings | None = None,
+    config: ProviderSettings | None = None,
+) -> ModelCatalog:
+    """Return the provider's models together with the outcome of the lookup."""
+    return await get_adapter(provider, settings, config).fetch_models()
+
+
+async def list_models(
+    provider: LLMProviderType | str | None = None,
+    settings: AppSettings | None = None,
+    config: ProviderSettings | None = None,
+) -> list[ModelInfo]:
     """Return the models available on a provider."""
-    return await get_adapter(provider).list_models()
+    return (await fetch_models(provider, settings, config)).models
 
 
 def get_llm(
@@ -132,9 +153,9 @@ def get_llm(
     resolved_top_p = settings.llm.top_p if top_p is None else top_p
     resolved_streaming = settings.llm.streaming if streaming is None else streaming
 
-    credential = adapter.config.api_key if provider_type.requires_api_key else (
-        adapter.config.effective_base_url()
-    )
+    # Both parts matter: a custom endpoint can change either its address or
+    # its key, and the cached client must not survive either change.
+    credential = (adapter.config.api_key, adapter.config.effective_base_url())
     cache_key = (
         provider_type,
         model,
@@ -194,4 +215,17 @@ def translate_error(provider: LLMProviderType, exc: Exception) -> LLMError:
     if "not found" in text and "model" in text:
         return ProviderUnavailableError(label, "The selected model is not available.")
 
-    return ProviderUnavailableError(label, str(exc))
+    return ProviderUnavailableError(label, _readable_reason(provider, exc))
+
+
+def _readable_reason(provider: LLMProviderType, exc: Exception) -> str:
+    """Compact an SDK message into something safe to show to the user.
+
+    Gemini puts the credential in the request URL, so the raw text of a
+    transport error can contain the key itself.
+    """
+    reason = " ".join(str(exc).split())
+    key = (get_settings().provider(provider).api_key or "").strip()
+    if key:
+        reason = reason.replace(key, "***")
+    return reason[:300]

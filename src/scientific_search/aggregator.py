@@ -18,6 +18,9 @@ from observability.logger import get_logger, log_event
 from scientific_search.arxiv_provider import ArxivProvider
 from scientific_search.base import ScientificSearchProvider, SearchResult
 from scientific_search.crossref import CrossrefProvider
+from scientific_search.custom_source import CustomSearchProvider
+from scientific_search.doaj import DOAJProvider
+from scientific_search.europe_pmc import EuropePMCProvider
 from scientific_search.openalex import OpenAlexProvider
 from scientific_search.pubmed import PubMedProvider
 from scientific_search.semantic_scholar import SemanticScholarProvider
@@ -38,6 +41,8 @@ _PROVIDERS: dict[SearchProviderType, type[ScientificSearchProvider]] = {
     SearchProviderType.OPENALEX: OpenAlexProvider,
     SearchProviderType.CROSSREF: CrossrefProvider,
     SearchProviderType.PUBMED: PubMedProvider,
+    SearchProviderType.EUROPE_PMC: EuropePMCProvider,
+    SearchProviderType.DOAJ: DOAJProvider,
     SearchProviderType.TAVILY: TavilyProvider,
 }
 
@@ -45,8 +50,32 @@ _PROVIDERS: dict[SearchProviderType, type[ScientificSearchProvider]] = {
 def build_provider(
     provider_type: SearchProviderType, settings: AppSettings
 ) -> ScientificSearchProvider:
-    """Instantiate one search provider."""
+    """Instantiate one built-in search provider (custom sources use ``build_providers``)."""
     return _PROVIDERS[provider_type](settings)
+
+
+def build_providers(
+    provider_types: list[SearchProviderType], settings: AppSettings
+) -> list[ScientificSearchProvider]:
+    """Instantiate every provider behind the given types.
+
+    ``CUSTOM`` expands to one provider per user-defined source, which is why
+    the aggregator works on instances rather than enum members.
+    """
+    providers: list[ScientificSearchProvider] = []
+    for provider_type in provider_types:
+        if provider_type is SearchProviderType.CUSTOM:
+            providers.extend(
+                CustomSearchProvider(settings, source)
+                for source in settings.custom_search_sources
+            )
+        elif provider_type in _PROVIDERS:
+            providers.append(build_provider(provider_type, settings))
+    return providers
+
+
+def _is_available(provider_type: SearchProviderType, settings: AppSettings) -> bool:
+    return any(p.is_available() for p in build_providers([provider_type], settings))
 
 
 def available_providers(settings: AppSettings) -> list[SearchProviderType]:
@@ -54,24 +83,69 @@ def available_providers(settings: AppSettings) -> list[SearchProviderType]:
     return [
         provider_type
         for provider_type in settings.retrieval.search_providers
-        if provider_type in _PROVIDERS and build_provider(provider_type, settings).is_available()
+        if provider_type.is_builtin_database and _is_available(provider_type, settings)
     ]
 
 
 def effective_search_providers(settings: AppSettings) -> list[SearchProviderType]:
     """Return the providers one auto-search request should actually query.
 
-    Tavily is not one of the user-selectable "scientific databases" - it is a
-    general web search used as a bonus source. It is added automatically
-    whenever a key is configured, with no need to select it and no warning
-    when it is not: it was never explicitly requested in the first place.
+    Tavily and the user's custom sources are not "scientific databases" one
+    ticks in the list: Tavily joins automatically when a key is configured,
+    custom sources whenever at least one is enabled and configured. Neither
+    produces a warning when absent - they were never explicitly requested.
     """
     selected = available_providers(settings)
-    if SearchProviderType.TAVILY not in selected and build_provider(
-        SearchProviderType.TAVILY, settings
-    ).is_available():
-        selected = [*selected, SearchProviderType.TAVILY]
+    for bonus in (SearchProviderType.TAVILY, SearchProviderType.CUSTOM):
+        if bonus not in selected and _is_available(bonus, settings):
+            selected = [*selected, bonus]
     return selected
+
+
+def covering_providers(
+    settings: AppSettings,
+    domain: str,
+    exclude: list[SearchProviderType] | None = None,
+) -> list[SearchProviderType]:
+    """Key-free databases that index ``domain`` and are not in ``exclude``.
+
+    Used when the databases the user selected cannot hold the literature of a
+    question (or have failed): a clinical question sent only to arXiv can
+    never be answered, whatever the query says. The result is restricted to
+    providers that need no credentials, so nothing is called on the user's
+    behalf that they have not been able to configure.
+    """
+    excluded = set(exclude or [])
+    return [
+        provider_type
+        for provider_type in _PROVIDERS
+        if provider_type not in excluded
+        and not provider_type.requires_api_key
+        and any(
+            p.is_available() and p.covers(domain)
+            for p in build_providers([provider_type], settings)
+        )
+    ]
+
+
+def uncovered_domain(
+    settings: AppSettings,
+    providers: list[SearchProviderType],
+    domain: str,
+    failed: set[str] | None = None,
+) -> bool:
+    """Whether no working provider in ``providers`` indexes ``domain``.
+
+    ``failed`` holds the labels of providers whose calls errored; a database
+    that covers the field but returned nothing usable does not count.
+    """
+    if not domain:
+        return False
+    failed_labels = failed or set()
+    return not any(
+        provider.covers(domain) and provider.label not in failed_labels
+        for provider in build_providers(providers, settings)
+    )
 
 
 class SearchAggregator:
@@ -90,20 +164,23 @@ class SearchAggregator:
     ) -> list[SearchResult]:
         """Run every query against every provider and merge the outcome."""
         selected = providers or available_providers(self._settings)
-        active = [p for p in selected if p in _PROVIDERS]
+        instances = [p for p in build_providers(selected, self._settings) if p.is_available()]
         unique_queries = _unique([q.strip() for q in queries if q.strip()])
 
-        if not active or not unique_queries:
+        if not instances or not unique_queries:
             return []
 
         self.provider_errors = {}
         semaphore = asyncio.Semaphore(self._concurrency)
+        # A provider's own tolerance (e.g. one request per second without a
+        # key) bounds its requests separately from the global fan-out.
+        per_provider = {
+            id(provider): asyncio.Semaphore(max(1, provider.max_concurrency()))
+            for provider in instances
+        }
 
-        async def run(provider_type: SearchProviderType, query: str) -> list[SearchResult]:
-            provider = build_provider(provider_type, self._settings)
-            if not provider.is_available():
-                return []
-            async with semaphore:
+        async def run(provider: ScientificSearchProvider, query: str) -> list[SearchResult]:
+            async with semaphore, per_provider[id(provider)]:
                 try:
                     results = await provider.search(query, limit_per_query)
                     for rank, result in enumerate(results, start=1):
@@ -115,12 +192,12 @@ class SearchAggregator:
                             result.best_provider_rank = rank
                     return results
                 except Exception as exc:  # noqa: BLE001 - one provider must not stop the rest
-                    self.provider_errors[provider_type.label] = str(exc)
+                    self.provider_errors[provider.label] = str(exc)
                     log_event(logger, "search.provider_failed", "Provider failed",
-                              level=30, provider=provider_type.value, error=str(exc))
+                              level=30, provider=provider.label, error=str(exc))
                     return []
 
-        tasks = [run(provider, query) for provider in active for query in unique_queries]
+        tasks = [run(provider, query) for provider in instances for query in unique_queries]
         batches = await asyncio.gather(*tasks)
 
         merged = merge_results([result for batch in batches for result in batch])
@@ -132,7 +209,7 @@ class SearchAggregator:
             )
 
         log_event(logger, "search.aggregated", "Search completed",
-                  providers=len(active), queries=len(unique_queries), papers=len(merged))
+                  providers=len(instances), queries=len(unique_queries), papers=len(merged))
         return merged
 
 

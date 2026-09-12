@@ -158,6 +158,7 @@ flowchart TD
     START([Start]) --> LM[load_memory]
     LM --> QU[query_understanding]
     QU -- conversational --> CA[conversational_answer]
+    QU -- needs clarification --> AC[ask_clarification]
     QU -- research --> LD[load_documents]
     QU -- error --> HE[handle_error]
 
@@ -176,6 +177,7 @@ flowchart TD
 
     DRL --> GA
     CA --> FO[format_output]
+    AC --> FO
     GA -- error --> HE
     GA -- has evidence --> VA[validate_answer]
     GA -- no evidence --> FO

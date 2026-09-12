@@ -30,9 +30,66 @@ class _AlwaysSelect:
         )
 
 
+class _RejectEverything:
+    """A stub LLM client that judges no node worth opening."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def structured(self, prompt_key, model_cls, temperature=0.0, **kwargs):
+        self.calls += 1
+        return model_cls(
+            evaluations=[
+                {
+                    "node_id": node_id,
+                    "decision": NodeDecision.REJECTED,
+                    "reason": "stub",
+                    "relevance_score": 0.0,
+                    "confidence_score": 0.9,
+                }
+                for node_id in kwargs["node_ids"]
+            ]
+        )
+
+
 class _RateLimitedNavigatorClient:
     async def structured(self, prompt_key, model_cls, temperature=0.0, **kwargs):
         raise RuntimeError("rate_limit_exceeded: tokens per minute quota reached")
+
+
+async def test_a_rejected_paper_still_contributes_citable_pages() -> None:
+    """One short paper used to supply every reference in the answer.
+
+    The short paper is taken whole because it fits its share, which filled the
+    result and suppressed the only fallback, so papers whose sections were all
+    rejected were dropped and could never be cited.
+    """
+    index = ChatIndex(chat_id="chat-1")
+    index.attach(make_tree("doc-short", "Short Paper", ["Introduction"]))
+    index.attach(
+        make_tree("doc-long", "Long Paper", ["Intro", "Method", "Results", "Discussion"])
+    )
+
+    navigator = TreeNavigator(_RejectEverything(), max_depth=2, page_budget=12)
+
+    result = await navigator.navigate(index, "What did the papers find?")
+
+    assert set(result.pages_by_document) == {"doc-short", "doc-long"}
+    assert result.pages_by_document["doc-long"]
+
+
+async def test_the_rescue_reads_the_section_closest_to_the_question() -> None:
+    index = ChatIndex(chat_id="chat-1")
+    index.attach(
+        make_tree("doc-a", "Paper A", ["Introduction", "Consensus throughput", "Appendix"])
+    )
+
+    navigator = TreeNavigator(_RejectEverything(), max_depth=2, page_budget=6)
+
+    result = await navigator.navigate(index, "What is the consensus throughput?")
+
+    # "Consensus throughput" is the second section, pages 3-4.
+    assert result.pages_by_document["doc-a"][0] == 3
 
 
 async def test_page_budget_is_shared_fairly_across_selected_papers() -> None:

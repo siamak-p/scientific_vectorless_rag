@@ -52,7 +52,30 @@ def price_table(provider_type: LLMProviderType) -> dict[str, dict[str, float]]:
     return provider_entry(provider_type).get("prices", {}) or {}
 
 
+def pricing_source() -> str:
+    """Return the URL of the published price catalogue."""
+    return str((load_catalog().get("pricing", {}) or {}).get("source", ""))
+
+
+def pricing_refresh_days() -> int:
+    """Return how many days a downloaded price catalogue stays current."""
+    return int((load_catalog().get("pricing", {}) or {}).get("refresh_days", 7))
+
+
 def search_endpoint(provider_key: str) -> str:
     """Return the configured HTTP endpoint of a scientific search provider."""
     entry = load_catalog().get("search_providers", {}).get(provider_key, {}) or {}
     return str(entry.get("endpoint", ""))
+
+
+def search_covers(provider_key: str, domain: str) -> bool:
+    """Whether a search provider indexes literature of the given research field.
+
+    An unknown provider or an empty domain is treated as covered, so routing
+    only ever narrows when the catalogue positively says a database lacks a field.
+    """
+    if not domain:
+        return True
+    entry = load_catalog().get("search_providers", {}).get(provider_key, {}) or {}
+    covers = {str(field).lower() for field in entry.get("covers") or ["all"]}
+    return "all" in covers or domain.lower() in covers

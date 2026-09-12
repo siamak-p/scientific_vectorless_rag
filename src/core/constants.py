@@ -86,6 +86,7 @@ class LLMProviderType(str, Enum):
     GROQ = "groq"
     OLLAMA = "ollama"
     LMSTUDIO = "lmstudio"
+    CUSTOM = "custom"
 
     @property
     def label(self) -> str:
@@ -98,9 +99,21 @@ class LLMProviderType(str, Enum):
         return self in (LLMProviderType.OLLAMA, LLMProviderType.LMSTUDIO)
 
     @property
+    def requires_base_url(self) -> bool:
+        """Whether the endpoint is supplied by the user rather than fixed."""
+        return self.is_local or self is LLMProviderType.CUSTOM
+
+    @property
+    def accepts_api_key(self) -> bool:
+        """Whether a credential can be sent to this provider at all."""
+        return not self.is_local
+
+    @property
     def requires_api_key(self) -> bool:
         """Whether a credential must be configured before the provider is usable."""
-        return not self.is_local
+        # A custom endpoint may be an unauthenticated server on the user's own
+        # network, so its key is offered but never demanded.
+        return self.accepts_api_key and self is not LLMProviderType.CUSTOM
 
 
 _PROVIDER_LABELS: dict[LLMProviderType, str] = {
@@ -110,6 +123,7 @@ _PROVIDER_LABELS: dict[LLMProviderType, str] = {
     LLMProviderType.GROQ: "Groq",
     LLMProviderType.OLLAMA: "Ollama (local)",
     LLMProviderType.LMSTUDIO: "LM Studio (local)",
+    LLMProviderType.CUSTOM: "Custom (OpenAI compatible)",
 }
 
 DEFAULT_OLLAMA_URL: str = "http://localhost:11434"
@@ -148,7 +162,12 @@ class SearchProviderType(str, Enum):
     CROSSREF = "crossref"
     ARXIV = "arxiv"
     PUBMED = "pubmed"
+    EUROPE_PMC = "europe_pmc"
+    DOAJ = "doaj"
     TAVILY = "tavily"
+    # User-defined JSON endpoints (Settings -> Search -> Custom sources). One
+    # enum member stands for all of them; each source carries its own label.
+    CUSTOM = "custom"
 
     @property
     def label(self) -> str:
@@ -160,6 +179,11 @@ class SearchProviderType(str, Enum):
         """Whether the provider needs a credential to work at all."""
         return self is SearchProviderType.TAVILY
 
+    @property
+    def is_builtin_database(self) -> bool:
+        """Whether this is a fixed scientific database the user can tick."""
+        return self not in (SearchProviderType.TAVILY, SearchProviderType.CUSTOM)
+
 
 _SEARCH_LABELS: dict[SearchProviderType, str] = {
     SearchProviderType.SEMANTIC_SCHOLAR: "Semantic Scholar",
@@ -167,8 +191,27 @@ _SEARCH_LABELS: dict[SearchProviderType, str] = {
     SearchProviderType.CROSSREF: "Crossref",
     SearchProviderType.ARXIV: "arXiv",
     SearchProviderType.PUBMED: "PubMed",
+    SearchProviderType.EUROPE_PMC: "Europe PMC",
+    SearchProviderType.DOAJ: "DOAJ",
     SearchProviderType.TAVILY: "Tavily (web)",
+    SearchProviderType.CUSTOM: "Custom sources",
 }
+
+# Research fields the query planner assigns and search databases declare
+# coverage for (providers.yaml `covers`, custom sources' `covers`).
+RESEARCH_DOMAINS: tuple[str, ...] = (
+    "biomedicine",
+    "physics",
+    "mathematics",
+    "computer_science",
+    "engineering",
+    "chemistry",
+    "earth_and_environment",
+    "social_sciences",
+    "humanities",
+    "economics",
+    "general",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +274,10 @@ MAX_EVIDENCE_ITEMS: int = 20
 TOC_CHECK_PAGES: int = 20
 STRUCTURE_SCAN_CHARS: int = 30_000
 EVIDENCE_CONFIDENCE_THRESHOLD: float = 0.45
+
+# A search provider always returns its best matches, however weak. Below this
+# topical fit a result is treated as "nothing was found" rather than indexed.
+MIN_SEARCH_RELEVANCE: float = 0.15
 
 DEEP_RESEARCH_MAX_ITERATIONS: int = 3
 

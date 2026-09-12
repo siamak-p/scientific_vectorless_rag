@@ -93,6 +93,56 @@ async def test_existing_corpus_can_skip_search(document) -> None:
     ) == "skip"
 
 
+async def test_an_off_topic_corpus_always_triggers_search(document) -> None:
+    """Seen in production: 'no relevant papers, but general knowledge covers it'.
+
+    The assistant has no general-knowledge fallback, so a corpus with no paper
+    on the topic must search regardless of the model's search_needed flag.
+    """
+    client = _DecisionClient(
+        {
+            "search_needed": False,
+            "corpus_relevant": False,
+            "suggested_papers": 0,
+            "reasoning": "No indexed paper is about atelectasis, but it is basic knowledge.",
+        }
+    )
+
+    result = await _nodes(client, cap=3).assess_search_need(_state([document]))
+
+    assessment = result["search_assessment"]
+    assert assessment.search_needed is True
+    assert assessment.suggested_papers == 1
+    assert _route_after_search_assessment(
+        {"auto_search_enabled": True, "search_assessment": assessment}
+    ) == "search"
+
+
+async def test_an_off_topic_corpus_always_triggers_search(document) -> None:
+    """Seen in production: 'no relevant papers, but general knowledge covers it'.
+
+    The assistant has no general-knowledge fallback, so a corpus with no paper
+    on the topic must search regardless of the model's search_needed flag.
+    """
+    client = _DecisionClient(
+        {
+            "search_needed": False,
+            "corpus_relevant": False,
+            "suggested_papers": 0,
+            "reasoning": "No indexed paper is about atelectasis, but it is basic knowledge.",
+        }
+    )
+
+    result = await _nodes(client, cap=3).assess_search_need(_state([document]))
+
+    assessment = result["search_assessment"]
+    assert assessment.search_needed is True
+    assert assessment.suggested_papers == 1
+    assert _route_after_search_assessment(
+        {"auto_search_enabled": True, "search_assessment": assessment}
+    ) == "search"
+
+
 async def test_model_suggestion_is_capped_by_download_setting(document) -> None:
     client = _DecisionClient({"search_needed": True, "suggested_papers": 12})
 
@@ -147,7 +197,7 @@ async def test_auto_search_uses_suggested_count_not_configured_max(
     nodes = _nodes(_DecisionClient(), cap=5)
     captured: dict[str, int] = {}
 
-    async def fake_search_and_index(chat_id, queries, limit, existing):
+    async def fake_search_and_index(chat_id, queries, limit, existing, **kwargs):
         captured["limit"] = limit
         return [], []
 
@@ -255,14 +305,18 @@ def test_rate_limit_warning_names_provider_and_is_deduplicated() -> None:
     assert "Groq provider reached its rate limit" in warnings[0]
 
 
-async def test_terminal_rate_limit_is_explicit_but_other_internals_are_hidden() -> None:
+async def test_terminal_rate_limit_is_explicit_and_other_failures_state_their_reason() -> None:
     nodes = _nodes(_DecisionClient())
 
     limited = await nodes.handle_error({"error": "Rate limit exceeded for Groq"})
-    internal = await nodes.handle_error({"error": "secret parser stack trace"})
+    # Only a ScientificRAGError's user_message ever reaches this state field,
+    # and hiding it would leave the user with nothing to act on.
+    credentials = await nodes.handle_error(
+        {"error": "Invalid API key for provider 'Groq'."}
+    )
 
     assert "rate limit" in limited["answer"]
-    assert "secret parser stack trace" not in internal["answer"]
+    assert "Invalid API key for provider 'Groq'." in credentials["answer"]
 
 
 def test_newly_discovered_papers_are_guaranteed_a_reading_slot() -> None:

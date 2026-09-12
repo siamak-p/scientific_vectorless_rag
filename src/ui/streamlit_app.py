@@ -24,7 +24,7 @@ def main() -> None:
     """Configure the page and route to the requested view."""
     st.set_page_config(
         page_title=APP_NAME,
-        page_icon="�",
+        page_icon="🔬",
         layout="wide",
         initial_sidebar_state="expanded",
         menu_items={"about": APP_DESCRIPTION},
@@ -48,12 +48,9 @@ def main() -> None:
     chat = services.active_chat(settings)
     options = render_sidebar(chat, settings)
 
-    _, effective_model = services.effective_provider_model(chat, settings)
-    if effective_model == "not selected":
-        st.info(
-            "No model is selected yet. Open **Settings** in the sidebar to choose a "
-            "provider and model before asking a question."
-        )
+    hint = services.provider_setup_hint(settings)
+    if hint:
+        st.info(hint)
 
     render_chat(chat, settings, options)
 

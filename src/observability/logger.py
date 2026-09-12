@@ -27,6 +27,29 @@ _SENSITIVE_KEYS = ("api_key", "apikey", "token", "secret", "password", "authoriz
 _configured = False
 
 
+class _ConsoleFormatter(logging.Formatter):
+    """Console output that keeps the diagnostic context of a problem.
+
+    Only warnings and above carry their context: an operator watching the
+    terminal needs to know *why* something failed without opening the JSON
+    log, while routine progress lines stay on one readable line.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_CONSOLE_FORMAT)
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        context = getattr(record, "context", None)
+        if record.levelno < logging.WARNING or not isinstance(context, dict) or not context:
+            return line
+
+        details = " ".join(
+            f"{key}={value}" for key, value in _redact(context).items() if value not in (None, "")
+        )
+        return f"{line} | {details}" if details else line
+
+
 class _JsonFileFormatter(logging.Formatter):
     """Serialise log records as one JSON object per line."""
 
@@ -81,7 +104,7 @@ def configure_logging(level: int = logging.INFO) -> None:
 
     console = logging.StreamHandler(stream=sys.stderr)
     console.setLevel(level)
-    console.setFormatter(logging.Formatter(_CONSOLE_FORMAT))
+    console.setFormatter(_ConsoleFormatter())
     root.addHandler(console)
 
     file_handler = logging.handlers.RotatingFileHandler(
@@ -112,7 +135,10 @@ def log_event(
     operation: str,
     message: str,
     level: int = logging.INFO,
+    exc_info: bool = False,
     **context: Any,
 ) -> None:
     """Emit a structured event with an explicit operation name and context."""
-    logger.log(level, message, extra={"operation": operation, "context": context})
+    logger.log(
+        level, message, exc_info=exc_info, extra={"operation": operation, "context": context}
+    )

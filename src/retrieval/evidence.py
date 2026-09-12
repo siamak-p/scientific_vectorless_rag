@@ -151,14 +151,14 @@ class EvidenceExtractor:
             *(read_resilient(batch) for batch in _page_batches(pages))
         )
 
+        # An empty result from a successful extraction is a finding, not a
+        # failure: the pages do not answer the question. Substituting lexical
+        # passages here would fabricate "evidence" from off-topic pages and
+        # hide the zero-evidence outcome from the search-recovery route.
+        # Failed batches were already replaced page-by-page in read_resilient.
         evidence: list[EvidenceItem] = []
         for batch in batches:
             evidence.extend(batch)
-
-        if not evidence:
-            evidence = _fallback_evidence(
-                document, title, pages, question, outline or []
-            )
 
         log_event(
             logger,

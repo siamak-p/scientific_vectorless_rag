@@ -153,6 +153,7 @@ through the Settings page for credentials.
 | `retrieval` (`RetrievalSettings`) | `max_search_papers`, `search_providers`, `retrieval_depth`, `toc_check_pages`, `max_pages_per_query`, `max_evidence_items`, `download_pdfs` |
 | `interface` (`InterfaceSettings`) | `theme`, `streaming_enabled`, `show_token_usage` |
 | `research` (`ResearchSettings`) | `citation_format`, `default_answer_mode`, `deep_research_iterations`, `strict_grounding`, `show_retrieval_reasoning`, `auto_search_default`, `deep_research_default` |
+| `custom_search_sources` (`list[CustomSearchSource]`) | User-defined JSON search endpoints: `label`, `enabled`, `endpoint`, `query_param`, `limit_param`, `extra_params`, `api_key` (+ `api_key_header` / `api_key_param`), `results_path`, `field_map` (dotted paths to title/abstract/authors/year/doi/url/pdf_url), `covers` (research fields). Enabled sources are queried alongside the selected built-in databases (Semantic Scholar, OpenAlex, Crossref, arXiv, PubMed, Europe PMC, DOAJ). |
 | top level | `active_provider`, `tavily_api_key`, `semantic_scholar_api_key`, `contact_email` |
 
 All of these are also editable from the Settings page in the UI; the JSON file is simply the
@@ -202,10 +203,10 @@ returns only the keys it changes - this is what allows the SQLite checkpointer
 |---|---|
 | Request | `chat_id`, `query`, `mode`, `provider`, `model`, `explainability_enabled`, `auto_search_enabled`, `deep_research_enabled`, `search_attempted` |
 | Memory | `history`, `global_topics` |
-| Planning | `query_plan`, `is_conversational`, `search_assessment` |
+| Planning | `query_plan`, `is_conversational`, `needs_clarification`, `search_assessment` |
 | Corpus | `documents`, `selected_document_ids`, `paper_rankings`, `discovered_document_ids` |
 | Retrieval | `navigation_trace`, `pages_by_document`, `evidence` |
-| Answering | `answer`, `citations`, `validation`, `research_trace`, `formatted_answer` |
+| Answering | `answer`, `answer_is_notice`, `citations`, `validation`, `research_trace`, `formatted_answer` |
 | Bookkeeping | `token_usage` (accumulated across nodes via a custom reducer), `warnings`, `error` |
 
 ### Nodes (`graph/nodes.py: WorkflowNodes`)
@@ -213,25 +214,27 @@ returns only the keys it changes - this is what allows the SQLite checkpointer
 | Node | Responsibility |
 |---|---|
 | `load_memory` | Loads this chat's recent transcript and the cross-chat topic summary. |
-| `query_understanding` | Classifies the turn as conversational vs. research, and produces a `QueryPlan` (intent, search queries, decomposed sub-questions). |
+| `query_understanding` | Classifies the turn as conversational vs. research, detects the user's language, and produces a `QueryPlan` (intent, English search queries, decomposed sub-questions, a `correction_note` for a mistyped term, and `needs_clarification` + `clarification_question` when the topic cannot be identified). |
 | `conversational_answer` | Chat-only shortcut for small talk; never touches documents. |
+| `ask_clarification` | Asks the user what they meant (in their language) instead of researching a guess; nothing is searched or read. |
 | `load_documents` | Loads only the `DocumentRecord`s that belong to this chat. |
-| `assess_search_need` | Decides whether the existing corpus can already answer the query, producing a `SearchAssessment`. |
-| `auto_search` | Searches enabled providers, downloads and indexes new papers. |
+| `assess_search_need` | Decides whether the existing corpus can already answer the query, producing a `SearchAssessment`. `corpus_relevant=false` (no indexed paper is on the topic) always forces a search: the assistant has no general-knowledge fallback. |
+| `auto_search` | Searches enabled providers, screens each result's title/abstract against the question with the LLM (after a lexical relevance floor) so off-topic papers are never downloaded, then downloads and indexes the accepted papers. |
 | `rank_papers` | Scores every candidate document (relevance/recency/citations/quality/coverage) into `PaperRankingEntry` items so retrieval budget goes to the best sources. |
 | `navigate` | Walks the chat's PageIndex forest level by level, asking the LLM to accept/reject/partially-select each node, producing `NavigationDecision`s and a page list per document. |
-| `extract_evidence` | Reads the selected pages in token-bounded batches and extracts quoted, page-numbered `EvidenceItem`s. |
+| `extract_evidence` | Reads the selected pages in token-bounded batches and extracts quoted, page-numbered `EvidenceItem`s. An empty result from a successful extraction is kept as-is (the pages do not answer the question); lexical page passages are substituted only when the provider call itself fails. |
 | `rank_evidence` | Orders/trims evidence before answering. |
 | `prepare_evidence_gap_search` | One-shot recovery: if navigation/extraction produced zero evidence and auto-search is enabled, forces a fresh search rather than answering from nothing. |
 | `deep_research` (`DeepResearchLoop.run`) | Iterative gap-analysis loop (bounded by `deep_research_iterations`): read what's available, identify knowledge gaps, search/index more, repeat. |
-| `generate_answer` | Produces the final answer text (streamed) with inline evidence markers. |
+| `generate_answer` | Produces the final answer text (streamed) with inline evidence markers, written in the user's language (`QueryPlan.language`). |
 | `validate_answer` | Audits each claim against the evidence, strips unsupported statements, and produces a `ValidationReport`; also builds the final `Citation` list. |
-| `format_output` | Assembles the answer, warnings and bibliography into the response returned to the UI. |
+| `format_output` | Assembles the answer, warnings and bibliography into the response returned to the UI. Code-generated notices, warnings and the Notes/References labels are translated into the user's language in one call (English originals are kept on any failure), and the planner's `correction_note` is prepended. |
 | `handle_error` | Terminal node for any node that recorded `state["error"]`; produces a graceful reply without leaking internal detail. |
 
 ### Routing logic
 
-- **`_route_after_planning`** - `error` → `handle_error`; conversational → `conversational_answer`; else → `load_documents`.
+- **`_route_after_planning`** - `error` → `handle_error`; conversational → `conversational_answer`;
+  `needs_clarification` → `ask_clarification`; else → `load_documents`.
 - **`_route_after_search_assessment`** - only search when `auto_search_enabled` is set *and*
   the assessment says the corpus has a real gap; otherwise skip straight to `rank_papers`.
 - **`_route_after_evidence`** - deep-research mode (or `mode == DEEP_RESEARCH`) always goes to
@@ -467,6 +470,7 @@ flowchart TD
     START([Start]) --> LM[load_memory]
     LM --> QU[query_understanding]
     QU -- conversational --> CA[conversational_answer]
+    QU -- needs clarification --> AC[ask_clarification]
     QU -- research --> LD[load_documents]
     QU -- error --> HE[handle_error]
 
@@ -485,6 +489,7 @@ flowchart TD
 
     DRL --> GA
     CA --> FO[format_output]
+    AC --> FO
     GA -- error --> HE
     GA -- has evidence --> VA[validate_answer]
     GA -- no evidence --> FO

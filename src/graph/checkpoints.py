@@ -8,15 +8,42 @@ of Postgres to keep the application a self-contained local tool.
 from __future__ import annotations
 
 import asyncio
+import enum
+import inspect
 from contextlib import AsyncExitStack
 
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from pydantic import BaseModel
 
+from core import constants as core_constants
+from core import models as core_models
 from core.constants import CHECKPOINT_FILE, ensure_directories
 from observability.logger import get_logger, log_event
 
 logger = get_logger("graph.checkpoints")
+
+
+def _checkpointed_types() -> tuple[type, ...]:
+    """Return every domain type that may appear inside a checkpoint.
+
+    Derived from the modules themselves rather than listed by hand, so a new
+    state field cannot be forgotten here. LangGraph blocks the deserialisation
+    of types it was not told about, and warns about it until then.
+    """
+    return tuple(
+        obj
+        for module in (core_models, core_constants)
+        for obj in vars(module).values()
+        if inspect.isclass(obj)
+        and obj.__module__ == module.__name__
+        and issubclass(obj, (BaseModel, enum.Enum))
+    )
+
+
+def _serializer() -> JsonPlusSerializer:
+    return JsonPlusSerializer(allowed_msgpack_modules=_checkpointed_types())
 
 
 class CheckpointManager:
@@ -48,6 +75,7 @@ class CheckpointManager:
                 saver = await self._stack.enter_async_context(
                     AsyncSqliteSaver.from_conn_string(self._path)
                 )
+                saver.serde = _serializer()
                 await saver.setup()
                 self._saver = saver
                 log_event(logger, "checkpoint.ready", "Checkpointer ready", path=self._path)
@@ -56,7 +84,7 @@ class CheckpointManager:
                           "Persistent checkpointing unavailable, using memory",
                           level=30, error=str(exc))
                 self._stack = None
-                self._saver = InMemorySaver()
+                self._saver = InMemorySaver(serde=_serializer())
         return self._saver
 
     async def close(self) -> None:

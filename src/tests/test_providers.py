@@ -65,12 +65,15 @@ def test_every_provider_has_a_catalogue_entry(provider: LLMProviderType) -> None
     entry = load_catalog()["providers"][provider.value]
 
     assert entry.get("models_endpoint")
-    # Local runtimes expose whatever the user has pulled, so they ship no static list.
-    is_local = provider in {LLMProviderType.OLLAMA, LLMProviderType.LMSTUDIO}
-    assert bool(fallback_models(provider)) is not is_local
+    # A static list only makes sense where the line-up is fixed: local runtimes
+    # expose whatever the user has pulled, and a custom endpoint whatever it serves.
+    fixed_line_up = not provider.requires_base_url
+    assert bool(fallback_models(provider)) is fixed_line_up
 
 
-@pytest.mark.parametrize("provider", list(SearchProviderType))
+@pytest.mark.parametrize(
+    "provider", [p for p in SearchProviderType if p is not SearchProviderType.CUSTOM]
+)
 def test_every_search_provider_has_an_endpoint(provider: SearchProviderType) -> None:
     assert search_endpoint(provider.value).startswith("http")
 

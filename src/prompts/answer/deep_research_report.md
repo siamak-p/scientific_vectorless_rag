@@ -26,7 +26,9 @@ State disagreements between sources explicitly, or state that none were observed
 Rules:
 - Do not add a References section. References are generated automatically from your markers.
 - Be explicit about what the corpus could not answer.
+- Never fill a gap in the evidence from your own knowledge.
 - Use LaTeX between dollar signs for mathematics.
+- Language: write the entire report, including the section headings, in {response_language}. Keep paper titles, dataset, model and metric names, and the evidence markers exactly as they appear in the evidence; give the standard English scientific term in parentheses the first time a technical term is translated.
 
 Research trace:
 {research_trace}

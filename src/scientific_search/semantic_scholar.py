@@ -24,6 +24,11 @@ class SemanticScholarProvider(ScientificSearchProvider):
 
     provider_type = SearchProviderType.SEMANTIC_SCHOLAR
 
+    def max_concurrency(self) -> int:
+        # Unauthenticated access is limited to roughly one request per second;
+        # firing every query at once guarantees a 429 for all but the first.
+        return super().max_concurrency() if self.settings.semantic_scholar_api_key else 1
+
     async def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         """Search papers and map them onto the shared result model."""
         headers: dict[str, str] = {}

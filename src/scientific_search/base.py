@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from abc import ABC, abstractmethod
 from typing import Any
@@ -9,9 +10,11 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field
 
+from config.catalog import search_covers
 from core.constants import (
     HTTP_TIMEOUT_SECONDS,
     HTTP_USER_AGENT,
+    SEARCH_CONCURRENCY,
     SearchProviderType,
 )
 from core.exceptions import SearchProviderError
@@ -21,6 +24,10 @@ from observability.logger import get_logger, log_event
 logger = get_logger("scientific_search.base")
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+# A 429 from a public API is usually momentary; one or two short waits recover
+# far more often than giving the provider up for the whole turn.
+_RATE_LIMIT_ATTEMPTS = 3
+_RATE_LIMIT_MAX_WAIT_SECONDS = 6.0
 
 
 class SearchResult(BaseModel):
@@ -31,8 +38,16 @@ class SearchResult(BaseModel):
     pdf_url: str = ""
     is_open_access: bool = False
     provider: SearchProviderType
+    # Display name of the concrete source; differs from the enum label only for
+    # user-defined custom sources, which all share SearchProviderType.CUSTOM.
+    provider_label: str = ""
     query_relevance: float = Field(default=0.0, ge=0.0, le=1.0)
     best_provider_rank: int = Field(default=0, ge=0)
+
+    @property
+    def source_label(self) -> str:
+        """Name of the database this result came from."""
+        return self.provider_label or self.provider.label
 
     def dedup_key(self) -> str:
         """Return the key used to merge the same paper across providers."""
@@ -50,6 +65,15 @@ class ScientificSearchProvider(ABC):
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
 
+    @property
+    def label(self) -> str:
+        """Display name; custom sources override it with their own."""
+        return self.provider_type.label
+
+    def covers(self, domain: str) -> bool:
+        """Whether this provider indexes literature of ``domain``."""
+        return search_covers(self.provider_type.value, domain)
+
     @abstractmethod
     async def search(self, query: str, limit: int = 5) -> list[SearchResult]:
         """Return papers matching a query, ordered by the provider's relevance."""
@@ -57,6 +81,10 @@ class ScientificSearchProvider(ABC):
     def is_available(self) -> bool:
         """Whether the provider is usable with the current configuration."""
         return True
+
+    def max_concurrency(self) -> int:
+        """How many requests this provider tolerates at once from one client."""
+        return SEARCH_CONCURRENCY
 
     # -- shared HTTP helpers ---------------------------------------------
 
@@ -71,7 +99,7 @@ class ScientificSearchProvider(ABC):
         try:
             return payload.json()
         except ValueError as exc:
-            raise SearchProviderError(self.provider_type.label, "The response was not valid JSON.") from exc
+            raise SearchProviderError(self.label, "The response was not valid JSON.") from exc
 
     async def get_text(
         self,
@@ -91,22 +119,30 @@ class ScientificSearchProvider(ABC):
         merged = {"User-Agent": self._user_agent(), **(headers or {})}
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
-                response = await client.get(url, params=params, headers=merged)
-                response.raise_for_status()
-                return response
+                for attempt in range(1, _RATE_LIMIT_ATTEMPTS + 1):
+                    response = await client.get(url, params=params, headers=merged)
+                    if response.status_code != 429 or attempt == _RATE_LIMIT_ATTEMPTS:
+                        response.raise_for_status()
+                        return response
+                    wait = _retry_after_seconds(response, default=float(attempt))
+                    log_event(logger, "search.throttled",
+                              f"{self.label} asked to slow down; retrying",
+                              provider=self.provider_type.value, attempt=attempt, wait=wait)
+                    await asyncio.sleep(wait)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status == 429:
                 raise SearchProviderError(
-                    self.provider_type.label, "The provider rate limit was reached."
+                    self.label, "The provider rate limit was reached."
                 ) from exc
             raise SearchProviderError(
-                self.provider_type.label, f"The provider returned HTTP {status}."
+                self.label, f"The provider returned HTTP {status}."
             ) from exc
         except httpx.HTTPError as exc:
             raise SearchProviderError(
-                self.provider_type.label, "The provider could not be reached."
+                self.label, "The provider could not be reached."
             ) from exc
+        raise SearchProviderError(self.label, "The provider rate limit was reached.")
 
     def _user_agent(self) -> str:
         """Return a polite user agent, including a contact address when known."""
@@ -136,8 +172,18 @@ class ScientificSearchProvider(ABC):
         log_event(
             logger,
             "search.results",
-            f"{self.provider_type.label} returned {len(results)} result(s)",
+            f"{self.label} returned {len(results)} result(s)",
             provider=self.provider_type.value,
             query=query[:120],
             open_access=sum(1 for r in results if r.is_open_access),
         )
+
+
+def _retry_after_seconds(response: httpx.Response, default: float) -> float:
+    """Honour a numeric Retry-After header, bounded so a turn cannot stall."""
+    header = response.headers.get("Retry-After", "")
+    try:
+        wait = float(header) if header else default
+    except ValueError:
+        wait = default
+    return max(0.5, min(wait, _RATE_LIMIT_MAX_WAIT_SECONDS))

@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -67,6 +68,16 @@ class ProviderSettings(BaseModel):
             return DEFAULT_LMSTUDIO_URL
         return ""
 
+    def missing_requirement(self) -> str:
+        """Name what still has to be configured before this provider can answer."""
+        if self.provider_type.requires_base_url and not self.effective_base_url().strip():
+            return "server URL"
+        if self.provider_type.requires_api_key and not self.api_key.strip():
+            return "API key"
+        if not self.selected_model.strip():
+            return "model"
+        return ""
+
 
 class LLMSettings(BaseModel):
     """Model level generation parameters."""
@@ -120,6 +131,75 @@ class ResearchSettings(BaseModel):
     deep_research_default: bool = False
 
 
+class ModelPrice(BaseModel):
+    """What one model charges, in USD per one million tokens."""
+
+    input: float = 0.0
+    output: float = 0.0
+    source: str = ""
+
+    def cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Return the USD cost of a call with these token counts."""
+        spend = (input_tokens / 1_000_000) * self.input
+        spend += (output_tokens / 1_000_000) * self.output
+        return round(spend, 6)
+
+
+class PricingSettings(BaseModel):
+    """How model prices are obtained."""
+
+    # Prices are not exposed by any provider API, so they are downloaded from
+    # the catalogue configured in providers.yaml rather than written in code.
+    auto_update: bool = True
+    # Keyed by "<provider>/<model>"; wins over every downloaded price.
+    overrides: dict[str, ModelPrice] = Field(default_factory=dict)
+
+
+class CustomSearchSource(BaseModel):
+    """A user-defined scientific database reached through a JSON GET endpoint.
+
+    Most academic APIs share one shape - a GET request with a query parameter
+    that returns a JSON list of records - and differ only in parameter and
+    field names. ``field_map`` holds dotted paths (``metadata.title``,
+    ``links.0.url``) from one record to the fields the pipeline needs.
+    """
+
+    id: str = Field(default_factory=new_id)
+    label: str = ""
+    enabled: bool = True
+    endpoint: str = ""
+    query_param: str = "q"
+    limit_param: str = ""
+    extra_params: dict[str, str] = Field(default_factory=dict)
+    api_key: str = ""
+    # The key is sent in this header when set, else as this query parameter.
+    api_key_header: str = ""
+    api_key_param: str = ""
+    results_path: str = "results"
+    field_map: dict[str, str] = Field(
+        default_factory=lambda: {
+            "title": "title",
+            "abstract": "abstract",
+            "authors": "authors",
+            "year": "year",
+            "doi": "doi",
+            "url": "url",
+            "pdf_url": "pdf_url",
+        }
+    )
+    covers: list[str] = Field(default_factory=lambda: ["all"])
+
+    def is_configured(self) -> bool:
+        """Whether the source has what a request needs: a name and an http(s) URL."""
+        parsed = urlparse(self.endpoint.strip())
+        return bool(self.label.strip()) and parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+    def covers_domain(self, domain: str) -> bool:
+        """Whether the source declares coverage of a research field."""
+        fields = {field.lower() for field in self.covers}
+        return not domain or "all" in fields or domain.lower() in fields
+
+
 class AppSettings(BaseModel):
     """Top level application settings, persisted as JSON in the app home."""
 
@@ -129,6 +209,8 @@ class AppSettings(BaseModel):
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     interface: InterfaceSettings = Field(default_factory=InterfaceSettings)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
+    pricing: PricingSettings = Field(default_factory=PricingSettings)
+    custom_search_sources: list[CustomSearchSource] = Field(default_factory=list)
     tavily_api_key: str = ""
     semantic_scholar_api_key: str = ""
     contact_email: str = ""
@@ -564,6 +646,32 @@ class QueryPlan(BaseModel):
     sub_questions: list[SubQuestion] = Field(default_factory=list)
     requires_multi_hop: bool = False
     is_conversational: bool = False
+    language: str = Field(
+        default="",
+        description="English name of the language the user wrote in, e.g. 'Persian'.",
+    )
+    domain: str = Field(
+        default="",
+        description=(
+            "Research field of the question, used to pick databases that index it; "
+            "one of core.constants.RESEARCH_DOMAINS."
+        ),
+    )
+    needs_clarification: bool = Field(
+        default=False,
+        description="True when the request cannot be researched until the user clarifies it.",
+    )
+    clarification_question: str = Field(
+        default="",
+        description="The question to ask the user, written in the user's language.",
+    )
+    correction_note: str = Field(
+        default="",
+        description=(
+            "Short note in the user's language explaining a corrected typo or "
+            "non-standard term that was interpreted; empty when nothing was corrected."
+        ),
+    )
 
     def questions(self) -> list[str]:
         """Return the sub-questions, falling back to the original query."""
@@ -578,6 +686,13 @@ class SearchAssessment(BaseModel):
     search_needed: bool = Field(
         default=False,
         description="True only when the existing papers cannot adequately cover the query.",
+    )
+    corpus_relevant: bool = Field(
+        default=True,
+        description=(
+            "False when no indexed paper is about the query's topic at all. The "
+            "assistant answers only from indexed papers, so this always requires a search."
+        ),
     )
     suggested_papers: int = Field(
         default=0,

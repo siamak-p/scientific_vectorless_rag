@@ -31,11 +31,13 @@ _ENV_KEYS: dict[LLMProviderType, str] = {
     LLMProviderType.ANTHROPIC: "ANTHROPIC_API_KEY",
     LLMProviderType.GOOGLE: "GOOGLE_API_KEY",
     LLMProviderType.GROQ: "GROQ_API_KEY",
+    LLMProviderType.CUSTOM: "CUSTOM_API_KEY",
 }
 
 _ENV_BASE_URLS: dict[LLMProviderType, str] = {
     LLMProviderType.OLLAMA: "OLLAMA_BASE_URL",
     LLMProviderType.LMSTUDIO: "LMSTUDIO_BASE_URL",
+    LLMProviderType.CUSTOM: "CUSTOM_BASE_URL",
 }
 
 
@@ -83,7 +85,7 @@ class SettingsManager:
         """Persist settings atomically, then refresh the in-memory cache."""
         with self._lock:
             self._apply_defaults(settings)
-            payload = settings.model_dump(mode="json")
+            payload = self._strip_environment(settings.model_dump(mode="json"))
             temp_path = self._settings_file.with_suffix(".tmp")
             try:
                 self._settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +136,7 @@ class SettingsManager:
 
     @staticmethod
     def _apply_environment(settings: AppSettings) -> None:
-        """Overlay credentials coming from the environment (never persisted)."""
+        """Overlay credentials coming from the environment."""
         for provider_type, env_name in _ENV_KEYS.items():
             value = os.environ.get(env_name, "").strip()
             if value:
@@ -156,6 +158,39 @@ class SettingsManager:
         contact = os.environ.get("SCIENTIFIC_RAG_CONTACT_EMAIL", "").strip()
         if contact:
             settings.contact_email = contact
+
+    @staticmethod
+    def _strip_environment(payload: dict) -> dict:
+        """Drop secrets that came from the environment from the saved file.
+
+        The environment overlay is applied on every load, so writing those
+        values back would silently copy a key out of the shell (or ``.env``)
+        into the settings file, where it would survive the variable being
+        removed or rotated.
+        """
+        providers = payload.get("providers", {})
+        for provider_type, env_name in _ENV_KEYS.items():
+            value = os.environ.get(env_name, "").strip()
+            entry = providers.get(provider_type.value)
+            if value and entry and entry.get("api_key") == value:
+                entry["api_key"] = ""
+
+        for provider_type, env_name in _ENV_BASE_URLS.items():
+            value = os.environ.get(env_name, "").strip()
+            entry = providers.get(provider_type.value)
+            if value and entry and entry.get("base_url") == value:
+                entry["base_url"] = ""
+
+        for field, env_name in (
+            ("tavily_api_key", "TAVILY_API_KEY"),
+            ("semantic_scholar_api_key", "SEMANTIC_SCHOLAR_API_KEY"),
+            ("contact_email", "SCIENTIFIC_RAG_CONTACT_EMAIL"),
+        ):
+            value = os.environ.get(env_name, "").strip()
+            if value and payload.get(field) == value:
+                payload[field] = ""
+
+        return payload
 
     def _restrict_permissions(self) -> None:
         """Restrict the settings file to the current user on POSIX systems."""

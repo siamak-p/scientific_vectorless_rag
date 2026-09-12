@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+bin/
+etc/
+include/
+lib/
+lib64
+lib64/
+pyvenv.cfg
+share/
+graphify-out/
+.github/

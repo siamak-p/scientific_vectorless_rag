@@ -338,6 +338,8 @@ def _parse_json_into(raw: str, schema: type[T]) -> T:
     if start != -1 and end > start:
         candidate = candidate[start : end + 1]
 
+    if not candidate:
+        raise ValueError(f"The model returned no JSON object (reply was: {raw.strip()[:200]!r})")
     return schema.model_validate(json.loads(candidate))
 
 

@@ -89,6 +89,9 @@ class DeepResearchLoop:
                 analysis.next_search_queries,
                 limit=paper_limit,
                 existing=documents,
+                question=question,
+                intent=analysis.next_focus,
+                domain=plan.domain if plan else "",
             )
             warnings.extend(new_warnings)
             iteration.new_document_ids = [document.id for document in added]
@@ -181,6 +184,8 @@ def _focus_plan(plan: QueryPlan | None, analysis: _GapAnalysis, question: str) -
         search_queries=analysis.next_search_queries,
         sub_questions=(plan.sub_questions if plan else []),
         requires_multi_hop=True,
+        language=(plan.language if plan else ""),
+        domain=(plan.domain if plan else ""),
     )
 
 

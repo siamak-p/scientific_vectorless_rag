@@ -1,8 +1,9 @@
 """Workflow assembly.
 
-The graph routes a turn down one of three paths:
+The graph routes a turn down one of four paths:
 
 * a conversational shortcut that never touches the documents;
+* a clarification request when the planner cannot identify the topic;
 * the standard retrieval path: plan, rank, navigate, read, answer, verify;
 * the deep research path, which loops over gap analysis before answering.
 
@@ -35,6 +36,7 @@ def build_graph(context: RunContext, checkpointer=None):
     builder.add_node("load_memory", nodes.load_memory)
     builder.add_node("query_understanding", nodes.query_understanding)
     builder.add_node("conversational_answer", nodes.conversational_answer)
+    builder.add_node("ask_clarification", nodes.ask_clarification)
     builder.add_node("load_documents", nodes.load_documents)
     builder.add_node("assess_search_need", nodes.assess_search_need)
     builder.add_node("prepare_evidence_gap_search", nodes.prepare_evidence_gap_search)
@@ -58,11 +60,13 @@ def build_graph(context: RunContext, checkpointer=None):
         {
             "error": "handle_error",
             "conversational": "conversational_answer",
+            "clarify": "ask_clarification",
             "research": "load_documents",
         },
     )
 
     builder.add_edge("conversational_answer", "format_output")
+    builder.add_edge("ask_clarification", "format_output")
     builder.add_edge("load_documents", "assess_search_need")
     builder.add_conditional_edges(
         "assess_search_need",
@@ -104,7 +108,11 @@ def _route_after_planning(state: GraphState) -> str:
     """Send chat-level questions down the shortcut and failures to recovery."""
     if state.get("error"):
         return "error"
-    return "conversational" if state.get("is_conversational") else "research"
+    if state.get("is_conversational"):
+        return "conversational"
+    if state.get("needs_clarification"):
+        return "clarify"
+    return "research"
 
 
 def _route_after_search_assessment(state: GraphState) -> str:
@@ -169,7 +177,22 @@ class WorkflowRunner:
             deep_research_enabled=deep_research_enabled,
         )
 
-        final: GraphState = await graph.ainvoke(state, config=thread_config(self.chat.id))
+        try:
+            final: GraphState = await graph.ainvoke(state, config=thread_config(self.chat.id))
+        except Exception as exc:  # noqa: BLE001 - logged, then re-raised unchanged
+            log_event(
+                logger,
+                "workflow.failed",
+                "Turn failed before an answer was produced",
+                level=40,
+                exc_info=True,
+                chat_id=self.chat.id,
+                mode=mode.value,
+                provider=self.context.client.provider.value,
+                model=self.context.client.model,
+                error=str(exc),
+            )
+            raise
 
         log_event(
             logger,
@@ -187,15 +210,16 @@ def to_answer(state: GraphState) -> GeneratedAnswer:
     """Convert the terminal graph state into the public answer object."""
     payload = state.get("formatted_answer") or {}
     answer = state.get("answer", "")
+    labels = {**{"notes": "Notes", "references": "References"}, **payload.get("labels", {})}
 
     warnings = state.get("warnings", [])
     if warnings:
         notes = "\n".join(f"- {warning}" for warning in warnings)
-        answer = f"{answer}\n\n---\n**Notes**\n{notes}"
+        answer = f"{answer}\n\n---\n**{labels['notes']}**\n{notes}"
 
     references = payload.get("references")
     if references:
-        answer = f"{answer}\n\n## References\n\n{references}"
+        answer = f"{answer}\n\n## {labels['references']}\n\n{references}"
 
     return GeneratedAnswer(
         answer=answer.strip(),

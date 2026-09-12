@@ -56,6 +56,7 @@ class GraphState(TypedDict, total=False):
     # Planning
     query_plan: QueryPlan
     is_conversational: bool
+    needs_clarification: bool
     search_assessment: SearchAssessment
 
     # Corpus
@@ -71,6 +72,9 @@ class GraphState(TypedDict, total=False):
 
     # Answering
     answer: str
+    # True when `answer` is a code-generated notice (no evidence, ungrounded,
+    # error) rather than model output, so it can be rendered in the user's language.
+    answer_is_notice: bool
     citations: list[Citation]
     validation: ValidationReport
     research_trace: ResearchTrace
@@ -103,6 +107,8 @@ def initial_state(
         auto_search_enabled=auto_search_enabled,
         deep_research_enabled=deep_research_enabled,
         search_attempted=False,
+        needs_clarification=False,
+        answer_is_notice=False,
         documents=[],
         selected_document_ids=[],
         paper_rankings=[],

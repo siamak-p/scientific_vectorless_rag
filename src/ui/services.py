@@ -257,7 +257,9 @@ def refresh_memory(chat: Chat) -> None:
 
 def maybe_title_chat(chat: Chat, first_message: str) -> str:
     """Give an untitled conversation a name based on its first message."""
-    if chat.title not in {"", "New Chat"}:
+    # Compared case-insensitively: a fallback title that differs only in case
+    # would otherwise switch auto-titling off for that chat forever.
+    if chat.title.strip().lower() not in {"", "new chat"}:
         return chat.title
 
     client = LLMClient.for_chat(chat)
@@ -265,7 +267,7 @@ def maybe_title_chat(chat: Chat, first_message: str) -> str:
         title = run_async(client.complete("answer/chat_title", message=first_message))
     except ScientificRAGError:
         title = first_message
-    cleaned = " ".join(title.split()).strip("\"'.")[:60] or "New chat"
+    cleaned = " ".join(title.split()).strip("\"'.")[:60] or "New Chat"
     rename_chat(chat.id, cleaned)
     return cleaned
 
@@ -273,6 +275,22 @@ def maybe_title_chat(chat: Chat, first_message: str) -> str:
 def _provider_type(settings: AppSettings):
     """Resolve the configured provider, falling back to the library default."""
     return resolve_provider(settings.active_provider or None)
+
+
+def provider_setup_hint(settings: AppSettings) -> str:
+    """Return what still has to be configured before a question can be answered."""
+    try:
+        provider = _provider_type(settings)
+    except ScientificRAGError:
+        return "No provider is selected yet. Open **Settings** to choose one."
+
+    missing = settings.provider(provider).missing_requirement()
+    if not missing:
+        return ""
+    return (
+        f"The **{provider.label}** provider still needs its {missing}. "
+        "Open **Settings** to complete the configuration."
+    )
 
 
 def effective_provider_model(chat: Chat, settings: AppSettings) -> tuple[str, str]:

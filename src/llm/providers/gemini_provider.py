@@ -10,6 +10,9 @@ from config.catalog import provider_entry
 from core.constants import LLMProviderType
 from llm.base import ModelInfo, ProviderAdapter
 
+# Safety valve for the paginated model listing.
+_MAX_PAGES = 10
+
 
 class GeminiAdapter(ProviderAdapter):
     """Chat models served by the Google Generative Language API."""
@@ -40,23 +43,28 @@ class GeminiAdapter(ProviderAdapter):
         endpoint = provider_entry(self.provider_type).get(
             "models_endpoint", "https://generativelanguage.googleapis.com/v1beta/models"
         )
-        payload = await self.http_json(
-            endpoint, params={"key": self.require_api_key(), "pageSize": "200"}
-        )
+        key = self.require_api_key()
 
         models: list[ModelInfo] = []
-        for item in payload.get("models", []):
-            name = str(item.get("name", ""))
-            if not name:
-                continue
-            if "generateContent" not in (item.get("supportedGenerationMethods") or []):
-                continue
-            models.append(
-                ModelInfo(
-                    id=name.removeprefix("models/"),
-                    label=item.get("displayName", ""),
-                    provider=self.provider_type,
-                    context_window=item.get("inputTokenLimit"),
+        params = {"key": key, "pageSize": "200"}
+        for _ in range(_MAX_PAGES):
+            payload = await self.http_json(endpoint, params=params)
+            for item in payload.get("models", []):
+                name = str(item.get("name", ""))
+                if not name:
+                    continue
+                if "generateContent" not in (item.get("supportedGenerationMethods") or []):
+                    continue
+                models.append(
+                    ModelInfo(
+                        id=name.removeprefix("models/"),
+                        label=item.get("displayName", ""),
+                        provider=self.provider_type,
+                        context_window=item.get("inputTokenLimit"),
+                    )
                 )
-            )
+            token = payload.get("nextPageToken")
+            if not token:
+                break
+            params = {"key": key, "pageSize": "200", "pageToken": str(token)}
         return models
